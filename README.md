@@ -28,6 +28,8 @@ npm install
 npm run desktop
 ```
 
+**Windows: one-click launch.** After `npm install`, double-click **`Create Shortcut.bat`** once. It adds a **Budget Buddy** shortcut (with icon) to your Desktop and Start Menu that opens the app window directly, no terminal. Right-click it → *Pin to taskbar* if you like. Opening it again while it's running just brings the window forward. Re-run the .bat if you move the folder.
+
 To try it without a bank, open **Accounts → Load demo data**. Remove "Demo Bank" when you're done.
 
 ## 2. Connect Teller
