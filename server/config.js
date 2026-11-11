@@ -1,5 +1,5 @@
 'use strict';
-// Loads / saves user settings (Teller app ID, cert paths, Sheets webhook) in the data dir.
+// Loads / saves user settings (Plaid keys, Sheets webhook) in the data dir.
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
@@ -8,10 +8,9 @@ const DATA_DIR = process.env.BUDGETBUDDY_DATA || path.join(os.homedir(), '.budge
 const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 
 const DEFAULTS = {
-  tellerApplicationId: '',
-  tellerEnvironment: 'sandbox', // sandbox | development | production
-  tellerCertPath: '',
-  tellerKeyPath: '',
+  plaidClientId: '',
+  plaidSecret: '',
+  plaidEnvironment: 'sandbox', // sandbox | production
   sheetsWebhookUrl: '',
   sheetsSecret: '',
 };
@@ -23,7 +22,10 @@ function ensureDataDir() {
 function load() {
   ensureDataDir();
   try {
-    return { ...DEFAULTS, ...JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) };
+    const saved = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    const out = { ...DEFAULTS };
+    for (const key of Object.keys(DEFAULTS)) if (saved[key] !== undefined) out[key] = saved[key];
+    return out;
   } catch {
     return { ...DEFAULTS };
   }
@@ -34,9 +36,7 @@ function save(patch) {
   for (const key of Object.keys(DEFAULTS)) {
     if (patch[key] !== undefined) next[key] = String(patch[key]).trim();
   }
-  if (!['sandbox', 'development', 'production'].includes(next.tellerEnvironment)) {
-    next.tellerEnvironment = 'sandbox';
-  }
+  if (!['sandbox', 'production'].includes(next.plaidEnvironment)) next.plaidEnvironment = 'sandbox';
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(next, null, 2), { mode: 0o600 });
   return next;
 }

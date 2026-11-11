@@ -1,8 +1,10 @@
 # Budget Buddy
 
-A personal budgeting desktop app that pulls your bank data from the [Teller API](https://teller.io/docs/api).
+A personal budgeting desktop app that pulls your bank data from the [Plaid API](https://plaid.com/docs/api/).
 
-- **Sync** accounts, balances and transactions from any bank Teller supports
+> **Moving from Teller?** Teller shut down its API. Your old data stays put: connect each bank again through Plaid and Budget Buddy copies your categories, tags and notes onto the matching Plaid transactions, then removes the Teller duplicates. Older history Plaid doesn't have is kept. See [Switching from Teller](#switching-from-teller).
+
+- **Sync** accounts, balances and transactions from any bank Plaid supports
 - **Quick updates:** edit category, tags and notes inline. Press Enter to save and jump to the next row, or bulk-tag selected rows.
 - **Budgets** per category with progress bars, plus spending by tag (e.g. `work-trip`, `gift`)
 - **Export** a month to Google Sheets in one click, or download a CSV
@@ -30,20 +32,26 @@ npm run desktop
 
 To try it without a bank, open **Accounts → Load demo data**. Remove "Demo Bank" when you're done.
 
-## 2. Connect Teller
+## 2. Connect Plaid
 
-1. Create an account at [teller.io](https://teller.io) and open the dashboard.
-2. Copy your **Application ID** (`app_…`).
-3. Download your **certificate**. The zip contains `certificate.pem` and `private_key.pem`. Keep them somewhere private, outside this repo.
-4. In Budget Buddy, open **Settings** and fill in:
-   - Application ID
-   - Environment: `sandbox` to test with fake banks (username `username`, password `password`); `development` or `production` for your real accounts
-   - Full paths to `certificate.pem` and `private_key.pem` (required for development and production)
-5. Go to **Accounts → Connect a bank** and finish the Teller Connect flow. The app saves the access token and runs a first sync.
+1. Sign up at [dashboard.plaid.com/signup](https://dashboard.plaid.com/signup). For a personal app, choose **Personal use**. New US/Canada teams get a free **Trial** plan with real bank data (limited to a handful of banks/Items); older accounts may have *Limited Production* instead.
+2. Open **Developers → Keys** and copy your **client_id** and the **secret** for the environment you want. Sandbox and Production have different secrets.
+3. In Budget Buddy, open **Settings** and fill in:
+   - Client ID and Secret
+   - Environment: `sandbox` to test with fake banks (username `user_good`, password `pass_good`), or `production` for your real accounts
+4. Go to **Accounts → Connect a bank** and finish the Plaid Link flow. The app swaps the one-time token for an access token, saves it and runs a first sync.
 
-Click **↻ Sync** any time to pull new transactions. The first sync gets full history. Later syncs only re-fetch from about 2 weeks before your newest transaction, which catches pending → posted changes.
+Click **↻ Sync** any time to pull new transactions. Budget Buddy asks Plaid for up to 2 years of history and uses Plaid's `/transactions/sync` cursor, so later syncs only download what changed. Right after you connect a bank, Plaid may still be fetching older history; if the sync says so, sync again in a few minutes. When a pending transaction posts, its tags and notes move to the posted version.
 
-If a bank shows **disconnected** (e.g. you changed your password), click **Reconnect**.
+If a bank shows **disconnected** (e.g. you changed your password), click **Reconnect** to log in again through Plaid Link. Your history is kept.
+
+Removing a bank under Accounts also tells Plaid to stop syncing it, so it no longer counts toward your plan.
+
+> Some big banks (Chase, Capital One, …) log in through their own site in a popup. Allow popups if your browser asks. In the desktop window this works automatically.
+
+### Switching from Teller
+
+Teller connections now show as **retired**. They no longer sync, but their transactions stay in place. Connect the same bank through Plaid. On every sync, Budget Buddy matches each Plaid account to the old Teller account with the same bank name and last 4 digits, then pairs up transactions with the same amount within 3 days of each other. For each pair it copies your category, tags, notes and Skip flag onto the Plaid transaction and deletes the Teller copy. Teller transactions older than Plaid's history are left alone. Once a Teller connection has nothing left, it's removed automatically. You can also remove it yourself under Accounts, but that deletes any history only Teller had.
 
 ## 3. Set up Google Sheets export (one time, ~2 min)
 
@@ -56,7 +64,7 @@ If a bank shows **disconnected** (e.g. you changed your password), click **Recon
 ## How the numbers work
 
 - Negative amounts are money out, positive amounts are money in. If a credit card shows purchases as positive, tick **Flip signs** for that account under Accounts.
-- **Spending/Income** leave out anything categorized `Transfer`, so card payments and moves between your own accounts aren't double counted. They also leave out any row with **Skip** ticked. Teller `transfer` transactions default to `Transfer`; recategorize any that are real spending (e.g. Zelle rent).
+- **Spending/Income** leave out anything categorized `Transfer`, so card payments and moves between your own accounts aren't double counted. They also leave out any row with **Skip** ticked. Plaid's transfer and credit-card-payment categories default to `Transfer`; recategorize any that are real spending (e.g. Zelle rent). Plaid reports money out as positive; Budget Buddy flips it so spending is negative everywhere, so **Flip signs** is rarely needed now.
 - Hidden accounts are left out everywhere.
 - Shortcuts: `←`/`→` change month, `/` jumps to search.
 
@@ -66,19 +74,19 @@ Everything is in `~/.budgetbuddy/` (override with `BUDGETBUDDY_DATA=/some/dir`):
 
 | File | Contents |
 | --- | --- |
-| `budgetbuddy.db` | accounts, transactions, your tags/notes/budgets, Teller access tokens |
-| `config.json` | settings (cert *paths*, not the certs themselves) |
+| `budgetbuddy.db` | accounts, transactions, your tags/notes/budgets, Plaid access tokens |
+| `config.json` | settings, including your Plaid client ID and secret |
 
-Both are created owner-only (`0600`/`0700`). The access tokens are stored unencrypted on disk, so treat this folder like a password file and keep your disk encrypted. The server only listens on `127.0.0.1`. It rejects requests sent under other hostnames and requires an app header on every write, so websites you visit can't reach it.
+Both are created owner-only (`0600`/`0700`). The access tokens and Plaid secret are stored unencrypted on disk, so treat this folder like a password file and keep your disk encrypted. The server only listens on `127.0.0.1`. It rejects requests sent under other hostnames and requires an app header on every write, so websites you visit can't reach it.
 
 ## Project layout
 
 ```
-server/      Node stdlib HTTP server, Teller mTLS client, SQLite (node:sqlite), sync, Sheets export
+server/      Node stdlib HTTP server, Plaid client, SQLite (node:sqlite), sync, Sheets export
 public/      UI (plain HTML/CSS/JS, no build step)
 electron/    desktop window wrapper
 google-sheets/Code.gs   Apps Script receiver for exports
-test/        node:test suite (fake Teller client + API tests)
+test/        node:test suite (fake Plaid client, Teller migration + API tests)
 ```
 
 ```bash

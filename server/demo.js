@@ -1,19 +1,17 @@
 'use strict';
 // Fake data so you can try the app before connecting a bank. Remove it from the Accounts tab.
-const { defaultCategory } = require('./sync');
-
 const MERCHANTS = [
-  ['Whole Foods', 'groceries', [-45, -160]],
-  ['Trader Joes', 'groceries', [-25, -90]],
-  ['Chipotle', 'dining', [-11, -28]],
-  ['Starbucks', 'dining', [-4, -12]],
-  ['Shell', 'fuel', [-30, -65]],
-  ['Netflix', 'entertainment', [-15.49, -15.49]],
-  ['Spotify', 'software', [-11.99, -11.99]],
-  ['Amazon', 'shopping', [-12, -140]],
-  ['Con Edison', 'utilities', [-70, -130]],
-  ['Uber', 'transport', [-9, -35]],
-  ['CVS Pharmacy', 'health', [-8, -45]],
+  ['Whole Foods', 'Groceries', 'FOOD_AND_DRINK_GROCERIES', [-45, -160]],
+  ['Trader Joes', 'Groceries', 'FOOD_AND_DRINK_GROCERIES', [-25, -90]],
+  ['Chipotle', 'Dining', 'FOOD_AND_DRINK_FAST_FOOD', [-11, -28]],
+  ['Starbucks', 'Dining', 'FOOD_AND_DRINK_COFFEE', [-4, -12]],
+  ['Shell', 'Fuel', 'TRANSPORTATION_GAS', [-30, -65]],
+  ['Netflix', 'Entertainment', 'ENTERTAINMENT_TV_AND_MOVIES', [-15.49, -15.49]],
+  ['Spotify', 'Entertainment', 'ENTERTAINMENT_MUSIC_AND_AUDIO', [-11.99, -11.99]],
+  ['Amazon', 'Shopping', 'GENERAL_MERCHANDISE_ONLINE_MARKETPLACES', [-12, -140]],
+  ['Con Edison', 'Utilities', 'RENT_AND_UTILITIES_GAS_AND_ELECTRICITY', [-70, -130]],
+  ['Uber', 'Transport', 'TRANSPORTATION_TAXIS_AND_RIDE_SHARES', [-9, -35]],
+  ['CVS Pharmacy', 'Health', 'MEDICAL_PHARMACIES_AND_SUPPLEMENTS', [-8, -45]],
 ];
 
 function rand(seed) {
@@ -25,13 +23,13 @@ function load(db) {
   const r = rand(42);
   db.exec('BEGIN');
   try {
-    db.prepare(`INSERT OR REPLACE INTO enrollments (id, access_token, institution, status, last_synced_at)
-                VALUES ('demo', 'demo', 'Demo Bank', 'ok', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))`).run();
+    db.prepare(`INSERT OR REPLACE INTO enrollments (id, provider, access_token, institution, status, last_synced_at)
+                VALUES ('demo', 'demo', 'demo', 'Demo Bank', 'ok', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))`).run();
     const acc = db.prepare(`INSERT OR REPLACE INTO accounts (id, enrollment_id, name, institution, type, subtype, last_four, currency, status, balance_available, balance_ledger)
                             VALUES (?, 'demo', ?, 'Demo Bank', ?, ?, ?, 'USD', 'open', ?, ?)`);
     acc.run('demo_checking', 'Everyday Checking', 'depository', 'checking', '1234', '3245.18', '3301.02');
     acc.run('demo_credit', 'Rewards Card', 'credit', 'credit_card', '9876', '4120.00', '880.00');
-    const tx = db.prepare(`INSERT OR REPLACE INTO transactions (id, account_id, date, amount, description, counterparty, teller_category, type, status, category, tags, note)
+    const tx = db.prepare(`INSERT OR REPLACE INTO transactions (id, account_id, date, amount, description, counterparty, bank_category, type, status, category, tags, note)
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     const today = new Date();
     let n = 0;
@@ -40,23 +38,22 @@ function load(db) {
       const date = day.toISOString().slice(0, 10);
       const status = d < 2 ? 'pending' : 'posted';
       if (day.getUTCDate() === 1 || day.getUTCDate() === 15) {
-        tx.run(`demo_tx_${n++}`, 'demo_checking', date, 2650, 'ACME CORP PAYROLL', 'Acme Corp', 'income', 'ach', status, 'Income', '', '');
+        tx.run(`demo_tx_${n++}`, 'demo_checking', date, 2650, 'ACME CORP PAYROLL', 'Acme Corp', 'INCOME_WAGES', 'other', status, 'Income', '', '');
       }
       if (day.getUTCDate() === 3) {
-        tx.run(`demo_tx_${n++}`, 'demo_checking', date, -1850, 'RENT PAYMENT', 'Parkview Apartments', 'home', 'ach', status, 'Home', 'rent', '');
+        tx.run(`demo_tx_${n++}`, 'demo_checking', date, -1850, 'RENT PAYMENT', 'Parkview Apartments', 'RENT_AND_UTILITIES_RENT', 'other', status, 'Home', 'rent', '');
       }
       if (day.getUTCDate() === 20) {
-        const t = { type: 'transfer', details: {} };
-        tx.run(`demo_tx_${n++}`, 'demo_checking', date, -600, 'PAYMENT TO REWARDS CARD', 'Demo Bank', null, 'transfer', status, defaultCategory(t), '', '');
+        tx.run(`demo_tx_${n++}`, 'demo_checking', date, -600, 'PAYMENT TO REWARDS CARD', 'Demo Bank', 'LOAN_PAYMENTS_CREDIT_CARD_PAYMENT', 'other', status, 'Transfer', '', '');
       }
       const count = Math.floor(r() * 3);
       for (let i = 0; i < count; i++) {
-        const [name, cat, [lo, hi]] = MERCHANTS[Math.floor(r() * MERCHANTS.length)];
+        const [name, cat, code, [lo, hi]] = MERCHANTS[Math.floor(r() * MERCHANTS.length)];
         const amount = Math.round((lo + (hi - lo) * r()) * 100) / 100;
         const account = r() < 0.6 ? 'demo_credit' : 'demo_checking';
         const tags = name === 'Uber' && r() < 0.5 ? 'work-trip' : name === 'Amazon' && r() < 0.3 ? 'gift' : '';
         const note = tags === 'work-trip' ? 'Expense this' : '';
-        tx.run(`demo_tx_${n++}`, account, date, amount, `${name.toUpperCase()} #${1000 + Math.floor(r() * 9000)}`, name, cat, 'card_payment', status, defaultCategory({ details: { category: cat } }), tags, note);
+        tx.run(`demo_tx_${n++}`, account, date, amount, `${name.toUpperCase()} #${1000 + Math.floor(r() * 9000)}`, name, code, 'in store', status, cat, tags, note);
       }
     }
     for (const [cat, limit] of [['Groceries', 500], ['Dining', 200], ['Shopping', 250], ['Entertainment', 50]]) {

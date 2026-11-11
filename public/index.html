@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Budget Buddy</title>
   <link rel="stylesheet" href="/styles.css" />
-  <script src="https://cdn.teller.io/connect/connect.js" defer></script>
+  <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js" defer></script>
 </head>
 <body>
   <aside class="sidebar">
@@ -105,7 +105,7 @@
       <div class="card">
         <h3>Accounts</h3>
         <table class="simple" id="accTable">
-          <thead><tr><th>Account</th><th>Type</th><th class="num">Available</th><th class="num">Ledger</th><th class="num">Txns</th><th>Flip signs</th><th>Hide</th></tr></thead>
+          <thead><tr><th>Account</th><th>Type</th><th class="num">Available</th><th class="num">Current</th><th class="num">Txns</th><th>Flip signs</th><th>Hide</th></tr></thead>
           <tbody></tbody>
         </table>
         <p class="hint">Use “Flip signs” if purchases on an account show up as income.</p>
@@ -114,17 +114,16 @@
 
     <section id="view-settings" class="view">
       <form id="settingsForm" class="card settings">
-        <h3>Teller</h3>
-        <label>Application ID <input name="tellerApplicationId" placeholder="app_xxxxxxxx" /></label>
+        <h3>Plaid</h3>
+        <p class="hint">From <a href="https://dashboard.plaid.com/developers/keys" target="_blank">dashboard.plaid.com → Developers → Keys</a>. Sandbox and Production have different secrets.</p>
+        <label>Client ID <input name="plaidClientId" placeholder="24-character client_id" autocomplete="off" /></label>
+        <label>Secret <input name="plaidSecret" type="password" placeholder="secret for the environment below" autocomplete="off" /></label>
         <label>Environment
-          <select name="tellerEnvironment">
-            <option value="sandbox">sandbox (fake banks, no certificate needed)</option>
-            <option value="development">development (your real banks, certificate required)</option>
-            <option value="production">production</option>
+          <select name="plaidEnvironment">
+            <option value="sandbox">sandbox (fake banks: user_good / pass_good)</option>
+            <option value="production">production (your real banks)</option>
           </select>
         </label>
-        <label>Certificate path (certificate.pem) <input name="tellerCertPath" placeholder="/Users/you/teller/certificate.pem" /></label>
-        <label>Private key path (private_key.pem) <input name="tellerKeyPath" placeholder="/Users/you/teller/private_key.pem" /></label>
 
         <h3>Google Sheets export</h3>
         <p class="hint">Deploy <code>google-sheets/Code.gs</code> as a web app (see README), then paste its URL here.</p>

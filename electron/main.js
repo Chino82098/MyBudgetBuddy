@@ -22,10 +22,10 @@ async function createWindow() {
     title: 'Budget Buddy',
     webPreferences: { contextIsolation: true, sandbox: true },
   });
-  // Teller Connect (and bank OAuth pages) may open popups; keep those in-app, send everything else to the browser.
+  // Plaid Link opens bank OAuth logins in a popup that starts on plaid.com; keep those in-app, send everything else to the browser.
   win.webContents.setWindowOpenHandler(({ url }) => {
     const host = new URL(url).hostname;
-    if (host.endsWith('teller.io')) return { action: 'allow' };
+    if (host.endsWith('.plaid.com') && host !== 'dashboard.plaid.com') return { action: 'allow' };
     shell.openExternal(url);
     return { action: 'deny' };
   });
