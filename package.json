@@ -1,0 +1,19 @@
+{
+  "name": "budget-buddy",
+  "version": "0.1.0",
+  "description": "Personal budgeting desktop app powered by the Teller API",
+  "main": "electron/main.js",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --no-warnings=ExperimentalWarning server/index.js",
+    "desktop": "electron .",
+    "test": "node --no-warnings=ExperimentalWarning --test test/*.test.js"
+  },
+  "devDependencies": {
+    "electron": "^38.0.0"
+  }
+}
