@@ -13,6 +13,17 @@ async function startServer() {
   }
 }
 
+// Lets Windows group the window with the Budget Buddy shortcut on the taskbar.
+if (process.platform === 'win32') app.setAppUserModelId('com.budgetbuddy.app');
+
+// Only one copy of the app: launching it again just brings the open window forward.
+const isFirstCopy = app.requestSingleInstanceLock();
+if (!isFirstCopy) app.quit();
+app.on('second-instance', () => {
+  const [win] = BrowserWindow.getAllWindows();
+  if (win) { if (win.isMinimized()) win.restore(); win.focus(); }
+});
+
 async function createWindow() {
   const { port } = await startServer();
   const win = new BrowserWindow({
@@ -20,6 +31,7 @@ async function createWindow() {
     height: 820,
     minWidth: 900,
     title: 'Budget Buddy',
+    icon: path.join(__dirname, '..', 'assets', process.platform === 'win32' ? 'icon.ico' : 'icon.png'),
     webPreferences: { contextIsolation: true, sandbox: true },
   });
   // Teller Connect (and bank OAuth pages) may open popups; keep those in-app, send everything else to the browser.
@@ -32,5 +44,5 @@ async function createWindow() {
   win.loadURL(`http://localhost:${port}/`);
 }
 
-app.whenReady().then(createWindow);
+if (isFirstCopy) app.whenReady().then(createWindow);
 app.on('window-all-closed', () => app.quit());
