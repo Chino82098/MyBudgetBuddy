@@ -10,8 +10,10 @@ function open(dataDir) {
     PRAGMA foreign_keys = ON;
 
     CREATE TABLE IF NOT EXISTS enrollments (
-      id TEXT PRIMARY KEY,
+      id TEXT PRIMARY KEY,           -- Plaid item_id
+      provider TEXT DEFAULT 'plaid', -- plaid | teller (retired) | demo
       access_token TEXT NOT NULL,
+      cursor TEXT,                   -- Plaid /transactions/sync cursor
       institution TEXT,
       user_id TEXT,
       status TEXT DEFAULT 'ok',
@@ -43,7 +45,7 @@ function open(dataDir) {
       amount REAL,
       description TEXT,
       counterparty TEXT,
-      teller_category TEXT,
+      bank_category TEXT,
       type TEXT,
       status TEXT,
       running_balance TEXT,
@@ -62,7 +64,28 @@ function open(dataDir) {
       monthly_limit REAL NOT NULL
     );
   `);
+  migrate(db);
   return db;
+}
+
+// Upgrades databases created by the Teller version of the app.
+function migrate(db) {
+  const cols = (t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name);
+  const enr = cols('enrollments');
+  if (!enr.includes('provider')) {
+    // Every enrollment that existed before Plaid support came from Teller.
+    db.exec("ALTER TABLE enrollments ADD COLUMN provider TEXT DEFAULT 'teller'");
+    db.exec("UPDATE enrollments SET provider='demo' WHERE id='demo'");
+  }
+  if (!enr.includes('cursor')) db.exec('ALTER TABLE enrollments ADD COLUMN cursor TEXT');
+  if (cols('transactions').includes('teller_category')) {
+    db.exec('ALTER TABLE transactions RENAME COLUMN teller_category TO bank_category');
+  }
+  db.prepare(
+    `UPDATE enrollments SET status='retired',
+       last_error='Teller shut down. Connect this bank again with Plaid; your categories, tags and notes carry over.'
+     WHERE provider='teller'`
+  ).run();
 }
 
 module.exports = { open };

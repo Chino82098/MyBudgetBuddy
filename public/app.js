@@ -15,7 +15,7 @@ async function api(path, opts = {}) {
     body: opts.body && typeof opts.body !== 'string' ? JSON.stringify(opts.body) : opts.body,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  if (!res.ok) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { code: data.code });
   return data;
 }
 
@@ -248,9 +248,9 @@ async function loadAccounts() {
         <div><strong>${esc(e.institution || e.id)}</strong>
           <div class="hint status-${esc(e.status)}">${e.status === 'ok' ? 'Connected' : esc(e.status)}${e.last_error ? ' — ' + esc(e.last_error) : ''}
           ${e.last_synced_at ? ' · last synced ' + new Date(e.last_synced_at).toLocaleString() : ''}</div></div>
-        <div>${e.status === 'disconnected' ? '<button class="reconnect">Reconnect</button> ' : ''}<button class="ghost remove" data-id="${esc(e.id)}">Remove</button></div>
+        <div>${e.status === 'disconnected' ? `<button class="reconnect" data-id="${esc(e.id)}">Reconnect</button> ` : ''}<button class="ghost remove" data-id="${esc(e.id)}" data-provider="${esc(e.provider)}">Remove</button></div>
       </div>`).join('')
-    : '<div class="hint">No banks connected yet. Add your Teller Application ID in Settings, then click Connect.</div>';
+    : '<div class="hint">No banks connected yet. Add your Plaid keys in Settings, then click Connect.</div>';
 
   $('#accTable tbody').innerHTML = accounts.map((a) => `<tr data-id="${esc(a.id)}">
       <td><strong>${esc(a.name)}</strong> <span class="hint">${esc(a.institution || '')} ····${esc(a.last_four || '')}</span></td>
@@ -277,39 +277,43 @@ $('#accTable').addEventListener('change', async (e) => {
 });
 $('#enrollList').addEventListener('click', async (e) => {
   if (e.target.classList.contains('remove')) {
-    if (!confirm('Remove this bank and all its downloaded transactions from Budget Buddy?')) return;
+    const msg = e.target.dataset.provider === 'teller'
+      ? 'Remove this old Teller connection? Any history Plaid did not re-download (and its tags/notes) will be deleted.'
+      : 'Remove this bank and all its downloaded transactions from Budget Buddy?';
+    if (!confirm(msg)) return;
     await api(`/api/enrollments/${encodeURIComponent(e.target.dataset.id)}`, { method: 'DELETE' });
     await loadMeta();
     loadAccounts();
   }
-  if (e.target.classList.contains('reconnect')) connectBank();
+  if (e.target.classList.contains('reconnect')) connectBank(e.target.dataset.id);
 });
 
-async function connectBank() {
-  const cfg = await api('/api/config');
-  if (!cfg.tellerApplicationId) {
-    toast('Add your Teller Application ID in Settings first.', true);
-    location.hash = 'settings';
+// Plaid Link. With enrollmentId it runs in "update mode" to fix an expired bank login.
+async function connectBank(enrollmentId) {
+  if (!window.Plaid) return toast('Plaid Link failed to load — check your internet connection.', true);
+  let token;
+  try {
+    ({ link_token: token } = await api('/api/plaid/link-token', { method: 'POST', body: { enrollmentId } }));
+  } catch (e) {
+    toast(e.message, true);
+    if (e.code === 'config.missing_keys') location.hash = 'settings';
     return;
   }
-  if (!window.TellerConnect) return toast('Teller Connect failed to load — check your internet connection.', true);
-  const tc = window.TellerConnect.setup({
-    applicationId: cfg.tellerApplicationId,
-    environment: cfg.tellerEnvironment,
-    products: ['transactions', 'balance'],
-    selectAccount: 'multiple',
-    onSuccess: async (enrollment) => {
+  const handler = window.Plaid.create({
+    token,
+    onSuccess: async (publicToken, metadata) => {
       try {
-        await api('/api/enrollments', { method: 'POST', body: enrollment });
+        if (enrollmentId) await api(`/api/enrollments/${encodeURIComponent(enrollmentId)}/reconnected`, { method: 'POST' });
+        else await api('/api/enrollments', { method: 'POST', body: { public_token: publicToken, institution: metadata.institution } });
         toast('Bank connected — syncing…');
         await runSync();
       } catch (e) { toast(e.message, true); }
     },
-    onFailure: (f) => toast(`Teller Connect: ${f.message || f.type || 'failed'}`, true),
+    onExit: (err) => err && toast(`Plaid: ${err.display_message || err.error_message || err.error_code}`, true),
   });
-  tc.open();
+  handler.open();
 }
-$('#connectBtn').addEventListener('click', connectBank);
+$('#connectBtn').addEventListener('click', () => connectBank());
 $('#demoBtn').addEventListener('click', (e) => busy(e.target, async () => {
   const r = await api('/api/demo', { method: 'POST' });
   toast(`Loaded ${r.transactions} demo transactions. Remove “Demo Bank” anytime.`);
@@ -324,7 +328,12 @@ async function runSync() {
   const n = results.reduce((a, r) => a + r.transactions, 0);
   if (!results.length) toast('No real banks connected yet — connect one under Accounts.');
   else if (errs.length) toast(errs.map((r) => `${r.institution || r.enrollment}: ${r.error}`).join(' · '), true);
-  else toast(`Synced ${n} transactions from ${results.length} bank(s)`);
+  else {
+    const moved = results.reduce((a, r) => a + (r.carriedOver || 0), 0);
+    const note = results.map((r) => r.note).find(Boolean);
+    toast(`Synced ${n} transactions from ${results.length} bank(s)` +
+      (moved ? ` · carried over ${moved} from Teller` : '') + (note ? ` · ${note}` : ''));
+  }
   await loadMeta();
   show(state.view);
 }

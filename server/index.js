@@ -6,7 +6,7 @@ const path = require('node:path');
 
 const config = require('./config');
 const { open } = require('./db');
-const teller = require('./teller');
+const plaid = require('./plaid');
 const { syncAll } = require('./sync');
 const { postToSheet } = require('./sheets');
 const demo = require('./demo');
@@ -88,7 +88,7 @@ function queryTransactions(db, q) {
   return db
     .prepare(
       `SELECT t.id, t.account_id, a.name AS account_name, a.institution, t.date, ${AMT} AS amount,
-              t.description, t.counterparty, t.teller_category, t.type, t.status, t.category,
+              t.description, t.counterparty, t.bank_category, t.type, t.status, t.category,
               t.tags, t.note, t.exclude
        FROM transactions t JOIN accounts a ON a.id=t.account_id
        WHERE ${where.join(' AND ')}
@@ -145,40 +145,64 @@ function summary(db, month) {
 }
 
 // ---------- app ----------
-function createApp() {
+// opts.plaidClient lets tests swap in a fake Plaid client.
+function createApp(opts = {}) {
   config.ensureDataDir();
   const db = open(config.DATA_DIR);
   let syncing = null;
+  const plaidClient = () => opts.plaidClient || plaid.createClient(config.load());
+  const mask = (c) => ({ ...c, sheetsSecret: c.sheetsSecret ? '••••••' : '', plaidSecret: c.plaidSecret ? '••••••' : '' });
 
   const routes = [];
   const route = (method, pattern, handler) => routes.push({ method, pattern, handler });
 
-  route('GET', /^\/api\/config$/, () => {
-    const c = config.load();
-    return { ...c, sheetsSecret: c.sheetsSecret ? '••••••' : '' };
-  });
+  route('GET', /^\/api\/config$/, () => mask(config.load()));
   route('PUT', /^\/api\/config$/, async (req) => {
     const body = await readJson(req);
     if (body.sheetsSecret === '••••••') delete body.sheetsSecret;
-    const c = config.save(body);
-    return { ...c, sheetsSecret: c.sheetsSecret ? '••••••' : '' };
+    if (body.plaidSecret === '••••••') delete body.plaidSecret;
+    return mask(config.save(body));
   });
 
   route('GET', /^\/api\/enrollments$/, () =>
-    db.prepare('SELECT id, institution, status, last_error, last_synced_at, created_at FROM enrollments').all()
+    db.prepare('SELECT id, provider, institution, status, last_error, last_synced_at, created_at FROM enrollments').all()
   );
-  route('POST', /^\/api\/enrollments$/, async (req) => {
-    // Body is the object Teller Connect passes to onSuccess.
+  // Step 1 of Plaid Link: a short-lived link token. With enrollmentId it opens "update mode" to fix a login.
+  route('POST', /^\/api\/plaid\/link-token$/, async (req) => {
     const b = await readJson(req);
-    if (!b.accessToken) throw Object.assign(new Error('accessToken missing'), { status: 400 });
-    const id = (b.enrollment && b.enrollment.id) || `enr_${Date.now()}`;
-    db.prepare(
-      `INSERT INTO enrollments (id, access_token, institution, user_id) VALUES (?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET access_token=excluded.access_token, status='ok', last_error=NULL`
-    ).run(id, b.accessToken, (b.enrollment && b.enrollment.institution && b.enrollment.institution.name) || null, (b.user && b.user.id) || null);
-    return { id };
+    let token;
+    if (b.enrollmentId) {
+      const en = db.prepare("SELECT access_token FROM enrollments WHERE id=? AND provider='plaid'").get(b.enrollmentId);
+      if (!en) throw Object.assign(new Error('Unknown bank connection'), { status: 404 });
+      token = en.access_token;
+    }
+    const r = await plaidClient().createLinkToken(token);
+    return { link_token: r.link_token };
   });
-  route('DELETE', /^\/api\/enrollments\/([\w-]+)$/, (req, m) => {
+  // Step 2: Link's onSuccess hands us a public token, which we swap for a permanent access token.
+  route('POST', /^\/api\/enrollments$/, async (req) => {
+    const b = await readJson(req);
+    if (!b.public_token) throw Object.assign(new Error('public_token missing'), { status: 400 });
+    const r = await plaidClient().exchangePublicToken(b.public_token);
+    const institution = (b.institution && b.institution.name) || null;
+    db.prepare(
+      `INSERT INTO enrollments (id, provider, access_token, institution) VALUES (?, 'plaid', ?, ?)
+       ON CONFLICT(id) DO UPDATE SET access_token=excluded.access_token, institution=COALESCE(excluded.institution, institution),
+         status='ok', last_error=NULL`
+    ).run(r.item_id, r.access_token, institution);
+    return { id: r.item_id };
+  });
+  // After update mode succeeds the access token is unchanged; just clear the error.
+  route('POST', /^\/api\/enrollments\/([\w-]+)\/reconnected$/, (req, m) => {
+    db.prepare("UPDATE enrollments SET status='ok', last_error=NULL WHERE id=?").run(m[1]);
+    return { ok: true };
+  });
+  route('DELETE', /^\/api\/enrollments\/([\w-]+)$/, async (req, m) => {
+    const en = db.prepare('SELECT provider, access_token FROM enrollments WHERE id=?').get(m[1]);
+    if (en && en.provider === 'plaid') {
+      // Tell Plaid to stop syncing (and billing) this bank. Don't block removal if it fails.
+      try { await plaidClient().removeItem(en.access_token); } catch {}
+    }
     db.prepare('DELETE FROM enrollments WHERE id=?').run(m[1]);
     return { ok: true };
   });
@@ -201,8 +225,9 @@ function createApp() {
 
   route('POST', /^\/api\/sync$/, async () => {
     if (!syncing) {
-      const client = teller.createClient(config.load());
-      syncing = syncAll(db, client).finally(() => (syncing = null));
+      const hasPlaid = db.prepare("SELECT 1 FROM enrollments WHERE provider='plaid' LIMIT 1").get();
+      if (!hasPlaid) return { results: [] };
+      syncing = syncAll(db, plaidClient()).finally(() => (syncing = null));
     }
     return { results: await syncing };
   });
@@ -309,7 +334,7 @@ function createApp() {
           if (out && out.__raw !== undefined) return send(res, 200, out.__raw, out.headers);
           return send(res, 200, out);
         } catch (e) {
-          return send(res, e.status || (e instanceof teller.TellerError ? 502 : 500), { error: e.message, code: e.code });
+          return send(res, e.status || (e instanceof plaid.PlaidError ? 502 : 500), { error: e.message, code: e.code });
         }
       }
       return send(res, 404, { error: 'Not found' });
@@ -326,8 +351,8 @@ function createApp() {
   return { handle, db };
 }
 
-function start(port = Number(process.env.PORT) || 4757) {
-  const app = createApp();
+function start(port = Number(process.env.PORT) || 4757, opts) {
+  const app = createApp(opts);
   const server = http.createServer(app.handle);
   return new Promise((resolve, reject) => {
     server.once('error', reject);
