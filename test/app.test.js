@@ -96,6 +96,26 @@ test('sync restarts when Plaid data changes mid-pagination', async () => {
   assert.equal(r.transactions, 2);
 });
 
+test('sync prefers real-time balances, falls back, and fills credit-card available', async () => {
+  const db = plaidDb();
+  const empty = async () => ({ added: [], modified: [], removed: [], next_cursor: 'c', has_more: false });
+  const cached = { accounts: [
+    { account_id: 'chk', name: 'Checking', mask: '7013', type: 'depository', subtype: 'checking', balances: { available: null, current: 444.92 } },
+    { account_id: 'cc', name: 'Card', mask: '4368', type: 'credit', subtype: 'credit card', balances: { available: null, current: 3, limit: 1000 } },
+  ] };
+  const live = { accounts: [{ ...cached.accounts[0], balances: { available: 440, current: 444.92 } }, cached.accounts[1]] };
+  let opts;
+  await syncAll(db, { getBalances: async (t, d) => { opts = d; return live; }, getAccounts: async () => cached, transactionsSync: empty });
+  const bal = (id) => db.prepare('SELECT balance_available FROM accounts WHERE id=?').get(id).balance_available;
+  assert.equal(Number(bal('chk')), 440);
+  assert.equal(Number(bal('cc')), 997);
+
+  await syncAll(db, { getBalances: async () => { throw new PlaidError('nope', 400, 'LAST_UPDATED_DATETIME_OUT_OF_RANGE'); },
+    getAccounts: async () => cached, transactionsSync: empty });
+  assert.equal(bal('chk'), null, 'falls back to cached data');
+  assert.equal(db.prepare('SELECT status FROM enrollments').get().status, 'ok');
+});
+
 test('sync records disconnected items', async () => {
   const db = plaidDb();
   const client = { getAccounts: async () => { throw new PlaidError('Log in again', 400, 'ITEM_LOGIN_REQUIRED'); } };
@@ -197,16 +217,62 @@ test('API: demo data, summary, edits, bulk, csv, security', async (t) => {
   assert.ok(!s.byCategory.some((c) => c.category === 'Transfer'), 'transfers excluded from spending');
   assert.ok(s.byCategory.find((c) => c.category === 'Groceries').budget === 500);
 
+  // Year / YTD / custom ranges: budgets scale with the number of months, long ranges chart by month.
+  const year = month.slice(0, 4);
+  const ys = (await call(`/api/summary?from=${year}-01-01&to=${year}-12-31`)).body;
+  assert.equal(ys.months, 12);
+  assert.equal(ys.granularity, 'month');
+  assert.equal(ys.byCategory.find((c) => c.category === 'Groceries').budget, 6000);
+  assert.ok(ys.spending >= s.spending - 0.001, 'a year includes this month');
+  const half = (await call('/api/summary?from=2026-04-16&to=2026-05-31')).body;
+  assert.equal(half.months, 1.5, 'half of April + all of May');
+  assert.equal(half.granularity, 'day');
+  const swapped = (await call(`/api/summary?from=${month}-28&to=${month}-01`)).body;
+  assert.equal(swapped.from, `${month}-01`, 'from/to are put in order');
+  assert.equal((await call('/api/summary?from=2026-13-01&to=2026-12-31')).status, 400);
+  const rangeTx = (await call(`/api/transactions?from=${month}-01&to=${month}-31`)).body;
+  assert.ok(rangeTx.length > 0 && rangeTx.every((t) => t.date.startsWith(month)));
+
   const list = (await call(`/api/transactions?month=${month}`)).body;
   const id = list[0].id;
   const patched = (await call(`/api/transactions/${id}`, { method: 'PATCH', body: JSON.stringify({ tags: 'Vacation, Big Trip ,vacation', note: 'test' }) })).body;
   assert.equal(patched.tags, 'vacation,big-trip');
+
+  // Amount search: exact with cents, whole-dollar band without, sign ignored, combines with text search.
+  const sample = list.find((x) => x.amount < 0 && Math.abs(x.amount) % 1 > 0.01);
+  const abs = Math.abs(sample.amount);
+  const exact = (await call(`/api/transactions?amount=${abs.toFixed(2)}`)).body;
+  assert.ok(exact.some((x) => x.id === sample.id) && exact.every((x) => Math.abs(Math.abs(x.amount) - abs) < 0.005));
+  const dollars = (await call(`/api/transactions?amount=${encodeURIComponent('$' + Math.floor(abs))}`)).body;
+  assert.ok(dollars.some((x) => x.id === sample.id) && dollars.every((x) => Math.floor(Math.abs(x.amount)) === Math.floor(abs)));
+  const both = (await call(`/api/transactions?q=${encodeURIComponent(sample.counterparty)}&amount=${abs.toFixed(2)}`)).body;
+  assert.ok(both.length >= 1 && both.every((x) => x.counterparty === sample.counterparty || x.description.includes(sample.counterparty)));
+  assert.equal((await call(`/api/transactions?amount=abc`)).status, 200, 'bad amount is ignored');
+
+  // Word search: all words must match, in any order, across description/merchant.
+  const words = sample.description.split(/\s+/).filter((w) => w.length > 1);
+  if (words.length > 1) {
+    const reversed = (await call(`/api/transactions?q=${encodeURIComponent(words.slice().reverse().join(' ').toLowerCase())}`)).body;
+    assert.ok(reversed.some((x) => x.id === sample.id), 'words match in any order');
+  }
+  assert.equal((await call(`/api/transactions?q=${encodeURIComponent(words[0] + ' zzqqxx')}`)).body.length, 0, 'every word must match');
+  assert.equal((await call(`/api/transactions?q=${encodeURIComponent('%')}`)).body.length, 0, '% is literal');
 
   const byTag = (await call(`/api/transactions?tag=big-trip`)).body;
   assert.equal(byTag.length, 1);
 
   await call('/api/transactions/bulk', { method: 'POST', body: JSON.stringify({ ids: list.slice(0, 3).map((x) => x.id), addTags: 'reviewed' }) });
   assert.equal((await call('/api/transactions?tag=reviewed')).body.length, 3);
+  // Bulk tag removal, on transactions that start untagged so other assertions aren't disturbed.
+  const three = (await call('/api/transactions?untagged=1')).body.slice(0, 3).map((x) => x.id);
+  assert.equal(three.length, 3);
+  await call('/api/transactions/bulk', { method: 'POST', body: JSON.stringify({ ids: three, addTags: 'zz-gone, zz-temp, keep-me' }) });
+  await call('/api/transactions/bulk', { method: 'POST', body: JSON.stringify({ ids: three, removeTags: 'zz-gone, zz-temp' }) });
+  assert.equal((await call('/api/transactions?tag=zz-gone')).body.length, 0, 'bulk removeTags drops the listed tags');
+  assert.equal((await call('/api/transactions?tag=zz-temp')).body.length, 0);
+  assert.equal((await call('/api/transactions?tag=keep-me')).body.length, 3, 'other tags are kept');
+  await call('/api/transactions/bulk', { method: 'POST', body: JSON.stringify({ ids: three, clearTags: true }) });
+  assert.equal((await call('/api/transactions?tag=keep-me')).body.length, 0, 'clearTags removes every tag');
 
   const before = (await call(`/api/summary?month=${month}`)).body.spending;
   const spend = list.find((x) => x.amount < 0 && x.category !== 'Transfer');
@@ -236,4 +302,83 @@ test('API: demo data, summary, edits, bulk, csv, security', async (t) => {
   assert.equal(synced[0].accounts, 1);
   await call('/api/enrollments/item_api', { method: 'DELETE' });
   assert.ok(fake.removed, 'item removed at Plaid too');
+});
+
+test('categories you set survive syncs; merchants are remembered for new transactions', async () => {
+  const db = plaidDb();
+  const mta = (id, date, extra = {}) => ptx(id, date, 2.9, { name: 'MTA*NYCT PAYGO', merchant_name: 'MTA',
+    personal_finance_category: { primary: 'GENERAL_SERVICES', detailed: 'GENERAL_SERVICES_OTHER' }, ...extra });
+  await syncAll(db, fakePlaid([{ added: [mta('m1', '2026-11-01'), mta('m2', '2026-11-02')], modified: [], removed: [], next_cursor: 'a', has_more: false }]));
+  const get = (id) => db.prepare('SELECT * FROM transactions WHERE id=?').get(id);
+  assert.equal(get('m1').category, 'Services');
+
+  // You change m1 through the API path's helpers.
+  const categories = require('../server/categories');
+  const cat = categories.ensure(db, 'commute');
+  assert.equal(cat, 'commute');
+  assert.equal(categories.ensure(db, 'COMMUTE'), 'commute', 'case-insensitive reuse');
+  db.prepare("UPDATE transactions SET category=?, category_manual=1, updated_at=datetime('now') WHERE id='m1'").run(cat);
+  categories.learn(db, get('m1'), cat);
+  assert.deepEqual(categories.similar(db, get('m1'), cat), ['m2']);
+
+  // Plaid modifies m1 and sends a new MTA charge: m1 keeps your pick, the new one follows it, m2 is untouched.
+  await syncAll(db, fakePlaid([{ added: [mta('m3', '2026-11-05')], modified: [mta('m1', '2026-11-01', { amount: 3.1 })], removed: [], next_cursor: 'b', has_more: false }]));
+  assert.deepEqual([get('m1').category, get('m1').amount], ['commute', -3.1]);
+  assert.equal(get('m3').category, 'commute');
+  assert.equal(get('m2').category, 'Services');
+
+  // A pending charge you edited is removed and re-posted under a new id with no link: edits move over.
+  await syncAll(db, fakePlaid([{ added: [ptx('p1', '2026-11-06', 12, { pending: true, merchant_name: 'Deli' })], modified: [], removed: [], next_cursor: 'c', has_more: false }]));
+  db.prepare("UPDATE transactions SET category='Lunch', category_manual=1, note='team', updated_at=datetime('now') WHERE id='p1'").run();
+  await syncAll(db, fakePlaid([{ added: [ptx('p1-posted', '2026-11-07', 14.5, { merchant_name: 'Deli' })], modified: [], removed: [{ transaction_id: 'p1' }], next_cursor: 'd', has_more: false }]));
+  assert.equal(get('p1'), undefined);
+  assert.deepEqual([get('p1-posted').category, get('p1-posted').note, get('p1-posted').category_manual], ['Lunch', 'team', 1]);
+
+  // Setting a merchant back to Uncategorized forgets it.
+  categories.learn(db, get('m1'), 'Uncategorized');
+  assert.equal(categories.ruleFor(db, get('m1')), null);
+});
+
+test('API: create, rename/merge, delete categories and apply to similar', async (t) => {
+  const { server, port } = await start(0, { plaidClient: fakePlaid([]) });
+  t.after(() => server.close());
+  const call = async (p, opts = {}) => {
+    const res = await fetch(`http://127.0.0.1:${port}${p}`, { ...opts, headers: { 'Content-Type': 'application/json', 'X-Budget-Buddy': '1' } });
+    return { status: res.status, body: await res.json() };
+  };
+  await call('/api/demo', { method: 'POST' });
+  const cats = (await call('/api/categories')).body.categories;
+  assert.ok(cats.includes('Groceries') && cats.includes('Transfer') && cats.includes('Uncategorized'));
+
+  assert.equal((await call('/api/categories', { method: 'POST', body: JSON.stringify({ name: '  Pet   Care ' }) })).body.name, 'Pet Care');
+  assert.ok((await call('/api/categories')).body.categories.includes('Pet Care'), 'unused custom category still listed');
+  assert.equal((await call('/api/categories', { method: 'POST', body: '{"name":"  "}' })).status, 400);
+
+  const list = (await call('/api/transactions')).body;
+  const tx = list.find((x) => x.counterparty && list.filter((y) => y.counterparty === x.counterparty).length > 1);
+  const p = (await call(`/api/transactions/${tx.id}`, { method: 'PATCH', body: JSON.stringify({ category: 'pet care' }) })).body;
+  assert.equal(p.category, 'Pet Care');
+  assert.ok(p.similar >= 1);
+  const applied = (await call(`/api/transactions/${tx.id}/apply-to-similar`, { method: 'POST' })).body;
+  assert.equal(applied.updated, p.similar);
+  const mgr = (await call('/api/categories/manage')).body;
+  assert.equal(mgr.categories.find((c) => c.name === 'Pet Care').count, 1 + p.similar);
+  assert.equal(mgr.rules.length, 1);
+
+  await call('/api/budgets', { method: 'PUT', body: JSON.stringify({ category: 'Pet Care', monthly_limit: 50 }) });
+  assert.equal((await call('/api/categories', { method: 'PATCH', body: JSON.stringify({ from: 'Pet Care', to: 'Pets' }) })).body.name, 'Pets');
+  let m = (await call('/api/categories/manage')).body;
+  assert.ok(!m.categories.some((c) => c.name === 'Pet Care'));
+  assert.deepEqual([m.categories.find((c) => c.name === 'Pets').budget, m.rules[0].category], [50, 'Pets']);
+
+  // Renaming onto an existing name merges.
+  assert.equal((await call('/api/categories', { method: 'PATCH', body: JSON.stringify({ from: 'Pets', to: 'shopping' }) })).body.name, 'Shopping');
+  assert.equal((await call('/api/categories', { method: 'PATCH', body: JSON.stringify({ from: 'Transfer', to: 'X' }) })).status, 400);
+
+  const del = (await call('/api/categories?name=Shopping', { method: 'DELETE' })).body;
+  assert.ok(del.moved >= 1);
+  m = (await call('/api/categories/manage')).body;
+  assert.ok(!m.categories.some((c) => c.name === 'Shopping'));
+  assert.equal(m.rules.length, 0);
+  assert.equal((await call('/api/categories?name=Uncategorized', { method: 'DELETE' })).status, 400);
 });

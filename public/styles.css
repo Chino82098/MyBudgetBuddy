@@ -30,12 +30,17 @@ button, input, select { font: inherit; color: inherit; }
 nav a { display: block; padding: 8px 10px; border-radius: 7px; color: var(--muted); text-decoration: none; margin-bottom: 2px; }
 nav a:hover { background: var(--bg); color: var(--ink); }
 nav a.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
-.sidebar-foot { margin-top: auto; font-size: 12px; color: var(--muted); padding: 0 8px; }
+.sidebar-foot { margin-top: auto; font-size: 12px; color: var(--muted); padding: 0 8px; display: flex; flex-direction: column; gap: 8px; }
+.sidebar-foot #syncBtn { width: 100%; font-size: 14px; }
 
 main { flex: 1; min-width: 0; padding: 0 24px 40px; }
 .topbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 16px 0; position: sticky; top: 0; background: var(--bg); z-index: 5; flex-wrap: wrap; }
 .month-picker { display: flex; align-items: center; gap: 4px; }
-.month-picker input { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 6px 8px; }
+.month-picker input, .month-picker select { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 6px 8px; }
+.month-picker select { margin-right: 4px; }
+.range-label { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 6px 12px; min-width: 120px; text-align: center; }
+.custom-range { display: inline-flex; align-items: center; gap: 4px; }
+.month-picker .hidden { display: none; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; }
 
 button { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 7px 12px; cursor: pointer; }
@@ -43,6 +48,10 @@ button:hover { border-color: var(--muted); }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button.ghost { background: transparent; }
 button.icon { padding: 6px 10px; }
+.edit-tools { display: flex; gap: 4px; }
+.edit-tools button.icon { display: grid; place-items: center; padding: 6px 8px; }
+.edit-tools button:disabled { opacity: .4; cursor: default; }
+.edit-tools button:disabled:hover { border-color: var(--line); }
 button:disabled { opacity: .55; cursor: progress; }
 
 .view { display: none; }
@@ -83,7 +92,8 @@ input:not([type=checkbox]), select { border: 1px solid var(--line); background: 
 input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
 
 .filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; align-items: center; }
-.filters #fSearch { flex: 1; min-width: 200px; }
+.filters #fSearch { flex: 1; min-width: 180px; }
+.filters #fAmount { width: 150px; }
 label.check { display: flex; align-items: center; gap: 5px; color: var(--muted); }
 .bulk { display: flex; gap: 8px; align-items: center; background: var(--accent-soft); padding: 8px 12px; border-radius: 8px; margin-bottom: 12px; flex-wrap: wrap; }
 .hidden { display: none !important; }
@@ -97,6 +107,11 @@ label.check { display: flex; align-items: center; gap: 5px; color: var(--muted);
 #txTable td input:not([type=checkbox]) { width: 100%; border-color: transparent; background: transparent; padding: 4px 6px; }
 #txTable td input:not([type=checkbox]):hover { border-color: var(--line); }
 #txTable td input:focus { background: var(--panel); border-color: var(--accent); }
+#txTable td select[data-f="category"] { width: 100%; border-color: transparent; background: transparent; padding: 4px 6px; cursor: pointer; }
+#txTable td select[data-f="category"]:hover { border-color: var(--line); }
+#txTable td select[data-f="category"]:focus { background: var(--panel); border-color: var(--accent); }
+select option { background: var(--panel); color: var(--ink); }
+input.new-cat { width: 100%; }
 #txTable .desc { max-width: 280px; }
 #txTable .desc .main { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #txTable .desc .sub { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -127,3 +142,33 @@ table.simple th { font-size: 12px; color: var(--muted); }
 .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--panel); padding: 10px 16px; border-radius: 8px; max-width: 80vw; z-index: 50; box-shadow: 0 6px 24px rgba(0,0,0,.2); }
 .toast.error { background: var(--neg); color: #fff; }
 .toast a { color: inherit; }
+
+/* category manager */
+.settings-wide { max-width: 620px; }
+.settings-wide .inline-form { margin: 0 0 10px; }
+#catManage { margin-bottom: 14px; }
+#catManage .rename-input { width: 100%; }
+button.small { padding: 2px 8px; font-size: 12px; }
+.rule { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; border-bottom: 1px solid var(--line); }
+.rule:last-child { border-bottom: 0; }
+.toast button.link { background: none; border: 0; color: inherit; text-decoration: underline; cursor: pointer; padding: 0 0 0 6px; font-weight: 600; }
+
+/* export tab */
+#view-export .card p { margin: 0 0 10px; }
+#view-export label.check { margin-top: 6px; }
+.card a { color: var(--accent); }
+
+/* Tag suggestions (autocomplete) */
+.tag-suggest { position: fixed; z-index: 40; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 24px rgba(0,0,0,.18); padding: 4px; max-height: 220px; overflow-y: auto; min-width: 160px; }
+.tag-suggest div { padding: 6px 10px; border-radius: 6px; cursor: pointer; white-space: nowrap; }
+.tag-suggest div.active, .tag-suggest div:hover { background: var(--accent-soft); color: var(--accent); }
+.tag-suggest b { font-weight: 700; }
+/* Remove-tags menu in the bulk bar */
+.menu-wrap { position: relative; }
+.menu { position: absolute; top: calc(100% + 4px); left: 0; z-index: 30; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 24px rgba(0,0,0,.18); padding: 4px; min-width: 180px; max-height: 280px; overflow-y: auto; }
+.menu button { display: flex; justify-content: space-between; gap: 12px; width: 100%; border: 0; background: none; text-align: left; padding: 6px 10px; border-radius: 6px; }
+.menu button:hover { background: var(--accent-soft); color: var(--accent); }
+.menu button .count { color: var(--muted); font-size: 12px; }
+.menu button.danger { color: var(--neg); }
+.menu hr { border: 0; border-top: 1px solid var(--line); margin: 4px 0; }
+.menu .empty-note { padding: 6px 10px; color: var(--muted); font-size: 13px; }

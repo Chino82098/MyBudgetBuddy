@@ -13,23 +13,41 @@
     <nav>
       <a href="#dashboard" data-view="dashboard">Dashboard</a>
       <a href="#transactions" data-view="transactions">Transactions</a>
+      <a href="#categories" data-view="categories">Categories</a>
       <a href="#accounts" data-view="accounts">Accounts</a>
+      <a href="#export" data-view="export">Export</a>
       <a href="#settings" data-view="settings">Settings</a>
     </nav>
-    <div class="sidebar-foot" id="lastSync"></div>
+    <div class="sidebar-foot">
+      <button id="syncBtn">↻ Sync</button>
+      <div id="lastSync"></div>
+    </div>
   </aside>
 
   <main>
     <header class="topbar">
       <div class="month-picker">
-        <button class="icon" id="prevMonth" title="Previous month">‹</button>
+        <select id="rangeMode" title="Date range">
+          <option value="month">Month</option>
+          <option value="year">1 Year</option>
+          <option value="ytd">Year to date</option>
+          <option value="custom">Custom range</option>
+        </select>
+        <button class="icon" id="prevMonth" title="Previous">‹</button>
         <input type="month" id="month" />
-        <button class="icon" id="nextMonth" title="Next month">›</button>
+        <span id="rangeLabel" class="range-label hidden"></span>
+        <span id="customRange" class="custom-range hidden">
+          <input type="date" id="fromDate" title="From" /> <span class="hint">to</span> <input type="date" id="toDate" title="To" />
+        </span>
+        <button class="icon" id="nextMonth" title="Next">›</button>
       </div>
-      <div class="actions">
-        <button id="syncBtn">↻ Sync</button>
-        <button id="csvBtn" class="ghost">Download CSV</button>
-        <button id="sheetsBtn" class="primary">Export to Google Sheets</button>
+      <div class="edit-tools" role="toolbar" aria-label="Edit">
+        <button class="icon" id="undoBtn" title="Undo (Ctrl+Z)" aria-label="Undo" disabled>
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>
+        </button>
+        <button class="icon" id="redoBtn" title="Redo (Ctrl+Y)" aria-label="Redo" disabled>
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 14 5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/></svg>
+        </button>
       </div>
     </header>
 
@@ -40,12 +58,12 @@
         <div class="tile"><div class="label">Net</div><div class="value" id="tNet">–</div></div>
       </div>
       <div class="card">
-        <h3>Daily spending</h3>
+        <h3 id="chartTitle">Daily spending</h3>
         <div id="dailyChart" class="chart"></div>
       </div>
       <div class="grid2">
         <div class="card">
-          <h3>Spending by category <span class="hint">click a budget to edit it</span></h3>
+          <h3>Spending by category <span class="hint" id="budgetHint">click a budget to edit it</span></h3>
           <div id="catList"></div>
           <form id="addBudget" class="inline-form">
             <input name="category" list="categoryOptions" placeholder="Category" required />
@@ -63,17 +81,22 @@
     <section id="view-transactions" class="view">
       <div class="filters">
         <input id="fSearch" type="search" placeholder="Search description, note, tag…" />
+        <input id="fAmount" type="search" inputmode="decimal" placeholder="Amount (optional)" title="45.23 finds that exact amount; 45 finds anything from $45.00 to $45.99" />
         <select id="fAccount"><option value="">All accounts</option></select>
         <select id="fCategory"><option value="">All categories</option></select>
         <select id="fTag"><option value="">All tags</option></select>
         <label class="check"><input type="checkbox" id="fUntagged" /> Untagged only</label>
-        <label class="check"><input type="checkbox" id="fAllTime" /> All months</label>
+        <label class="check"><input type="checkbox" id="fAllTime" /> All dates</label>
       </div>
       <div id="bulkBar" class="bulk hidden">
         <span id="bulkCount"></span>
-        <input id="bulkTag" placeholder="add tag(s)" />
+        <input id="bulkTag" placeholder="add tag(s)" autocomplete="off" />
         <button id="bulkTagBtn">Add tags</button>
-        <input id="bulkCat" list="categoryOptions" placeholder="set category" />
+        <span class="menu-wrap">
+          <button id="bulkUntagBtn" aria-haspopup="true">Remove tags ▾</button>
+          <div id="bulkUntagMenu" class="menu hidden" role="menu"></div>
+        </span>
+        <select id="bulkCat"><option value="">set category…</option></select>
         <button id="bulkCatBtn">Set category</button>
         <button id="bulkClear" class="ghost">Clear</button>
       </div>
@@ -90,7 +113,25 @@
         </table>
         <div id="txEmpty" class="empty hidden"></div>
       </div>
-      <div class="foot-hint">Tip: press <kbd>Enter</kbd> in a Tags or Note box to save and jump to the next row.</div>
+      <div class="foot-hint">Tip: press <kbd>Enter</kbd> in a Tags or Note box to save and jump to the next row. Pick “＋ New category…” in any Category list to make your own.</div>
+    </section>
+
+    <section id="view-categories" class="view">
+      <div class="card settings-wide">
+        <h3>Categories</h3>
+        <p class="hint">Add your own, rename (renaming onto an existing name merges the two), or delete. A category you set on a transaction is never changed by a sync.</p>
+        <form id="addCategory" class="inline-form">
+          <input name="name" placeholder="New category name" maxlength="60" required />
+          <button>Add category</button>
+        </form>
+        <table class="simple" id="catManage">
+          <thead><tr><th>Category</th><th class="num">Transactions</th><th class="num">Budget</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <h3>Remembered merchants</h3>
+        <p class="hint">New transactions from these merchants get this category automatically when you sync.</p>
+        <div id="ruleList"></div>
+      </div>
     </section>
 
     <section id="view-accounts" class="view">
@@ -109,6 +150,25 @@
           <tbody></tbody>
         </table>
         <p class="hint">Use “Flip signs” if purchases on an account show up as income.</p>
+      </div>
+    </section>
+
+    <section id="view-export" class="view">
+      <div class="card settings-wide">
+        <h3>What to export</h3>
+        <p>Range: <strong id="exportRange">–</strong> <span class="hint">(change it with the date picker above)</span></p>
+        <label class="check"><input type="checkbox" id="exAllTime" /> All dates instead</label>
+        <label class="check"><input type="checkbox" id="exUseFilters" /> Only transactions matching my Transactions filters <span class="hint" id="exFilterSummary"></span></label>
+      </div>
+      <div class="card settings-wide">
+        <h3>Download CSV</h3>
+        <p class="hint">A spreadsheet file you can open in Excel, Numbers or Google Sheets.</p>
+        <button id="csvBtn">Download CSV</button>
+      </div>
+      <div class="card settings-wide">
+        <h3>Export to Google Sheets</h3>
+        <p class="hint">Sends the range to your Google Sheet. Set up the web app URL in <a href="#settings">Settings</a>. Transactions filters don’t apply here.</p>
+        <button id="sheetsBtn" class="primary">Export to Google Sheets</button>
       </div>
     </section>
 
