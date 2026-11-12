@@ -2,6 +2,7 @@
 // Local SQLite storage using Node's built-in node:sqlite (Node 22.5+).
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
+const { BUILTIN, DEFAULTS } = require('./categories');
 
 function open(dataDir) {
   const db = new DatabaseSync(path.join(dataDir, 'budgetbuddy.db'));
@@ -54,6 +55,7 @@ function open(dataDir) {
       tags TEXT DEFAULT '',
       note TEXT DEFAULT '',
       exclude INTEGER DEFAULT 0,
+      category_manual INTEGER DEFAULT 0, -- 1 = you picked the category (sync and merchant rules leave it alone)
       updated_at TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_tx_date ON transactions(date);
@@ -62,6 +64,13 @@ function open(dataDir) {
     CREATE TABLE IF NOT EXISTS budgets (
       category TEXT PRIMARY KEY,
       monthly_limit REAL NOT NULL
+    );
+
+    -- Remembered merchants: new transactions from this merchant get this category on sync.
+    CREATE TABLE IF NOT EXISTS category_rules (
+      merchant TEXT PRIMARY KEY,
+      category TEXT NOT NULL,
+      updated_at TEXT
     );
   `);
   migrate(db);
@@ -78,6 +87,19 @@ function migrate(db) {
     db.exec("UPDATE enrollments SET provider='demo' WHERE id='demo'");
   }
   if (!enr.includes('cursor')) db.exec('ALTER TABLE enrollments ADD COLUMN cursor TEXT');
+  if (!cols('transactions').includes('category_manual')) {
+    db.exec('ALTER TABLE transactions ADD COLUMN category_manual INTEGER DEFAULT 0');
+    // Older rows: treat anything you edited as a category you chose, so nothing you set gets changed.
+    db.exec('UPDATE transactions SET category_manual=1 WHERE updated_at IS NOT NULL');
+  }
+  // Your category list. Created once with the defaults plus every category already in use;
+  // after that, categories you delete stay deleted.
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='categories'").get()) {
+    db.exec("CREATE TABLE categories (name TEXT PRIMARY KEY COLLATE NOCASE, created_at TEXT DEFAULT (datetime('now')))");
+    const add = db.prepare('INSERT OR IGNORE INTO categories (name) VALUES (?)');
+    const inUse = db.prepare('SELECT DISTINCT category AS c FROM transactions WHERE category IS NOT NULL UNION SELECT category FROM budgets').all();
+    for (const n of [...BUILTIN, ...DEFAULTS, ...inUse.map((r) => r.c)]) add.run(n);
+  }
   if (cols('transactions').includes('teller_category')) {
     db.exec('ALTER TABLE transactions RENAME COLUMN teller_category TO bank_category');
   }

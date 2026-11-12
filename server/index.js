@@ -10,6 +10,7 @@ const plaid = require('./plaid');
 const { syncAll } = require('./sync');
 const { postToSheet } = require('./sheets');
 const demo = require('./demo');
+const categories = require('./categories');
 
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png' };
@@ -27,6 +28,34 @@ function monthRange(month) {
   const [y, m] = month.split('-').map(Number);
   const end = new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
   return [`${month}-01`, end];
+}
+
+// A date range from ?from=YYYY-MM-DD&to=YYYY-MM-DD, falling back to ?month=YYYY-MM.
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+function dateRange(q) {
+  const ok = (d) => DATE_RE.test(d || '') && !Number.isNaN(Date.parse(d + 'T00:00:00Z'));
+  if (ok(q.from) && ok(q.to)) return q.from <= q.to ? [q.from, q.to] : [q.to, q.from];
+  return monthRange(q.month);
+}
+
+const DAY = 86400000;
+const utc = (d) => Date.parse(d + 'T00:00:00Z');
+const daysBetween = (from, to) => Math.round((utc(to) - utc(from)) / DAY) + 1;
+
+// How many months of budget a range covers: a whole month counts 1, a partial month its share of days.
+function budgetMonths([from, to]) {
+  let total = 0;
+  let [y, m] = from.split('-').map(Number);
+  for (;;) {
+    const first = `${y}-${String(m).padStart(2, '0')}-01`;
+    if (first > to) break;
+    const last = new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
+    const start = from > first ? from : first;
+    const end = to < last ? to : last;
+    total += daysBetween(start, end) / Number(last.slice(8));
+    if (++m > 12) { m = 1; y++; }
+  }
+  return Math.round(total * 100) / 100;
 }
 
 function send(res, status, body, headers = {}) {
@@ -59,10 +88,17 @@ function csvCell(v) {
 }
 
 // ---------- queries ----------
+function parseAmount(input) {
+  const raw = String(input ?? '').replace(/[$,\s]/g, '').replace(/^[-+]/, '');
+  if (!/^\d+(\.\d{0,2})?$|^\.\d{1,2}$/.test(raw)) return null;
+  const exact = raw.includes('.') && !raw.endsWith('.');
+  return { value: exact ? Math.round(Number(raw) * 100) / 100 : Math.floor(Number(raw)), exact };
+}
+
 function queryTransactions(db, q) {
   const where = ['a.hidden=0'];
   const params = [];
-  const range = monthRange(q.month);
+  const range = dateRange(q);
   if (range) {
     where.push('t.date BETWEEN ? AND ?');
     params.push(...range);
@@ -79,10 +115,25 @@ function queryTransactions(db, q) {
     where.push("(',' || t.tags || ',') LIKE ?");
     params.push(`%,${normTags(q.tag)},%`);
   }
-  if (q.q) {
-    where.push('(t.description LIKE ? OR t.counterparty LIKE ? OR t.note LIKE ? OR t.tags LIKE ?)');
-    const like = `%${q.q}%`;
+  // Text search: every word must appear somewhere (description, merchant, note or tags), in any order.
+  // "zelle spotlight" finds "Zelle payment from SPOTLIGHT ...". Matching is case-insensitive.
+  for (const word of String(q.q || '').trim().split(/\s+/).filter(Boolean)) {
+    where.push(
+      "(t.description LIKE ? ESCAPE '\\' OR t.counterparty LIKE ? ESCAPE '\\' OR t.note LIKE ? ESCAPE '\\' OR t.tags LIKE ? ESCAPE '\\')"
+    );
+    const like = `%${word.replace(/[\\%_]/g, (c) => '\\' + c)}%`;
     params.push(like, like, like, like);
+  }
+  // Amount: "45.23" matches that exact amount, "45" matches $45.00–$45.99. Sign is ignored (spend or income).
+  const amt = parseAmount(q.amount);
+  if (amt) {
+    if (amt.exact) {
+      where.push('ABS(ABS(t.amount) - ?) < 0.005');
+      params.push(amt.value);
+    } else {
+      where.push('ABS(t.amount) >= ? AND ABS(t.amount) < ?');
+      params.push(amt.value, amt.value + 1);
+    }
   }
   if (q.untagged === '1') where.push("t.tags=''");
   return db
@@ -98,9 +149,12 @@ function queryTransactions(db, q) {
     .all(...params);
 }
 
-function summary(db, month) {
-  const range = monthRange(month);
-  if (!range) throw Object.assign(new Error('month must be YYYY-MM'), { status: 400 });
+// q: { month: 'YYYY-MM' } or { from: 'YYYY-MM-DD', to: 'YYYY-MM-DD' }
+function summary(db, q) {
+  if (typeof q === 'string') q = { month: q };
+  const range = dateRange(q);
+  if (!range) throw Object.assign(new Error('month (YYYY-MM) or from/to (YYYY-MM-DD) required'), { status: 400 });
+  const months = budgetMonths(range);
   const base = `FROM transactions t JOIN accounts a ON a.id=t.account_id
     WHERE a.hidden=0 AND t.exclude=0 AND t.category<>'Transfer' AND t.date BETWEEN ? AND ?`;
   const totals = db
@@ -119,7 +173,8 @@ function summary(db, month) {
   const budgets = Object.fromEntries(db.prepare('SELECT * FROM budgets').all().map((b) => [b.category, b.monthly_limit]));
   const seen = new Set(byCategory.map((c) => c.category));
   for (const cat of Object.keys(budgets)) if (!seen.has(cat)) byCategory.push({ category: cat, spent: 0, count: 0 });
-  for (const c of byCategory) c.budget = budgets[c.category] ?? null;
+  // Budgets are monthly; scale them to the length of the range (a year = 12x).
+  for (const c of byCategory) c.budget = budgets[c.category] != null ? Math.round(budgets[c.category] * months * 100) / 100 : null;
 
   const byTag = {};
   for (const row of db.prepare(`SELECT t.tags, ${AMT} AS amt ${base} AND t.tags<>''`).all(...range)) {
@@ -129,11 +184,18 @@ function summary(db, month) {
       byTag[tag].count++;
     }
   }
+  // Long ranges are charted by month, short ones by day.
+  const granularity = daysBetween(...range) > 62 ? 'month' : 'day';
+  const bucket = granularity === 'month' ? 'substr(t.date, 1, 7)' : 't.date';
   const daily = db
-    .prepare(`SELECT t.date, SUM(-${AMT}) AS spent ${base} AND ${AMT}<0 GROUP BY t.date ORDER BY t.date`)
+    .prepare(`SELECT ${bucket} AS date, SUM(-${AMT}) AS spent ${base} AND ${AMT}<0 GROUP BY 1 ORDER BY 1`)
     .all(...range);
   return {
-    month,
+    month: q.month && monthRange(q.month) ? q.month : null,
+    from: range[0],
+    to: range[1],
+    months,
+    granularity,
     income: totals.income,
     spending: totals.spending,
     net: totals.income - totals.spending,
@@ -237,39 +299,98 @@ function createApp(opts = {}) {
     const b = await readJson(req);
     const sets = [];
     const params = [];
-    if (b.category !== undefined) sets.push('category=?') && params.push(String(b.category).trim() || 'Uncategorized');
+    const row = db.prepare('SELECT id, counterparty, description FROM transactions WHERE id=?').get(m[1]);
+    if (!row) throw Object.assign(new Error('Transaction not found'), { status: 404 });
+    let cat;
+    if (b.category !== undefined) {
+      cat = categories.ensure(db, b.category);
+      sets.push('category=?, category_manual=1') && params.push(cat);
+    }
     if (b.tags !== undefined) sets.push('tags=?') && params.push(normTags(b.tags));
     if (b.note !== undefined) sets.push('note=?') && params.push(String(b.note));
     if (b.exclude !== undefined) sets.push('exclude=?') && params.push(b.exclude ? 1 : 0);
     if (!sets.length) return { ok: true };
     db.prepare(`UPDATE transactions SET ${sets.join(', ')}, updated_at=datetime('now') WHERE id=?`).run(...params, m[1]);
-    return db.prepare('SELECT id, category, tags, note, exclude FROM transactions WHERE id=?').get(m[1]);
+    const out = db.prepare('SELECT id, category, tags, note, exclude FROM transactions WHERE id=?').get(m[1]);
+    if (cat !== undefined) {
+      // Remember this merchant for future syncs, and tell the UI how many look-alikes could follow.
+      out.merchant = categories.learn(db, row, cat);
+      out.similar = out.merchant ? categories.similar(db, row, cat).length : 0;
+      out.merchantName = row.counterparty || row.description;
+    }
+    return out;
+  });
+  // Apply a transaction's category to other auto-categorized transactions from the same merchant.
+  route('POST', /^\/api\/transactions\/([\w-]+)\/apply-to-similar$/, (req, m) => {
+    const row = db.prepare('SELECT id, counterparty, description, category FROM transactions WHERE id=?').get(m[1]);
+    if (!row) throw Object.assign(new Error('Transaction not found'), { status: 404 });
+    const ids = categories.similar(db, row, row.category);
+    const set = db.prepare('UPDATE transactions SET category=? WHERE id=?');
+    db.exec('BEGIN');
+    for (const id of ids) set.run(row.category, id);
+    db.exec('COMMIT');
+    return { updated: ids.length, category: row.category };
   });
   route('POST', /^\/api\/transactions\/bulk$/, async (req) => {
     const b = await readJson(req);
     const ids = Array.isArray(b.ids) ? b.ids : [];
-    const get = db.prepare('SELECT tags FROM transactions WHERE id=?');
+    const get = db.prepare('SELECT id, tags, counterparty, description FROM transactions WHERE id=?');
     const setTags = db.prepare(`UPDATE transactions SET tags=?, updated_at=datetime('now') WHERE id=?`);
-    const setCat = db.prepare(`UPDATE transactions SET category=?, updated_at=datetime('now') WHERE id=?`);
+    const setCat = db.prepare(`UPDATE transactions SET category=?, category_manual=1, updated_at=datetime('now') WHERE id=?`);
+    const cat = b.category ? categories.ensure(db, b.category) : null;
+    // Tags to take off: removeTags (comma list) or the older single removeTag; clearTags removes every tag.
+    const rm = normTags(b.removeTags ?? b.removeTag ?? '');
+    const drop = b.clearTags || rm ? new Set(rm.split(',')) : null;
     db.exec('BEGIN');
     for (const id of ids) {
       const row = get.get(id);
       if (!row) continue;
-      if (b.addTags) setTags.run(normTags(`${row.tags},${b.addTags}`), id);
-      if (b.removeTag) setTags.run(normTags(row.tags.split(',').filter((t) => t !== normTags(b.removeTag))), id);
-      if (b.category) setCat.run(String(b.category).trim(), id);
+      let tags = row.tags;
+      if (b.addTags) tags = normTags(`${tags},${b.addTags}`);
+      if (drop) tags = b.clearTags ? '' : normTags(tags.split(',').filter((t) => !drop.has(t)));
+      if (tags !== row.tags) setTags.run(tags, id);
+      if (cat) {
+        setCat.run(cat, id);
+        categories.learn(db, row, cat);
+      }
     }
     db.exec('COMMIT');
     return { updated: ids.length };
   });
 
   route('GET', /^\/api\/categories$/, () => {
-    const cats = db.prepare("SELECT DISTINCT category FROM transactions WHERE category IS NOT NULL").all().map((r) => r.category);
     const tags = new Set();
     for (const r of db.prepare("SELECT tags FROM transactions WHERE tags<>''").all()) r.tags.split(',').forEach((t) => tags.add(t));
     const budgets = db.prepare('SELECT * FROM budgets ORDER BY category').all();
-    const all = new Set([...cats, ...budgets.map((b) => b.category), 'Transfer', 'Uncategorized']);
-    return { categories: [...all].sort(), tags: [...tags].sort(), budgets };
+    for (const b of budgets) categories.ensure(db, b.category);
+    return { categories: categories.list(db), tags: [...tags].sort(), budgets };
+  });
+  // Category manager (Settings): counts, budgets and remembered merchants.
+  route('GET', /^\/api\/categories\/manage$/, () => {
+    const counts = Object.fromEntries(
+      db.prepare('SELECT category, COUNT(*) AS n FROM transactions GROUP BY category').all().map((r) => [r.category, r.n])
+    );
+    const budgets = Object.fromEntries(db.prepare('SELECT * FROM budgets').all().map((b) => [b.category, b.monthly_limit]));
+    return {
+      categories: categories.list(db).map((name) => ({
+        name, count: counts[name] || 0, budget: budgets[name] ?? null, builtin: categories.BUILTIN.includes(name),
+      })),
+      rules: db.prepare('SELECT merchant, category FROM category_rules ORDER BY merchant').all(),
+    };
+  });
+  route('POST', /^\/api\/categories$/, async (req) => {
+    const b = await readJson(req);
+    if (!categories.cleanName(b.name)) throw Object.assign(new Error('Category name required'), { status: 400 });
+    return { name: categories.ensure(db, b.name) };
+  });
+  route('PATCH', /^\/api\/categories$/, async (req) => {
+    const b = await readJson(req);
+    return { name: categories.rename(db, String(b.from || ''), b.to) };
+  });
+  route('DELETE', /^\/api\/categories$/, (req, m, url) => ({ moved: categories.remove(db, url.searchParams.get('name') || '') }));
+  route('DELETE', /^\/api\/category-rules$/, (req, m, url) => {
+    db.prepare('DELETE FROM category_rules WHERE merchant=?').run(url.searchParams.get('merchant') || '');
+    return { ok: true };
   });
   route('PUT', /^\/api\/budgets$/, async (req) => {
     const b = await readJson(req);
@@ -280,7 +401,7 @@ function createApp(opts = {}) {
     return { ok: true };
   });
 
-  route('GET', /^\/api\/summary$/, (req, m, url) => summary(db, url.searchParams.get('month')));
+  route('GET', /^\/api\/summary$/, (req, m, url) => summary(db, Object.fromEntries(url.searchParams)));
 
   route('GET', /^\/api\/export\.csv$/, (req, m, url) => {
     const rows = queryTransactions(db, Object.fromEntries(url.searchParams));
@@ -292,19 +413,24 @@ function createApp(opts = {}) {
           .map(csvCell).join(',')
       )
     );
-    const name = `budget-buddy-${url.searchParams.get('month') || 'all'}.csv`;
+    const sp = url.searchParams;
+    const range = dateRange(Object.fromEntries(sp));
+    const name = `budget-buddy-${sp.get('month') || (range ? `${range[0]}_to_${range[1]}` : 'all')}.csv`;
     return { __raw: lines.join('\n'), headers: { 'Content-Type': 'text/csv', 'Content-Disposition': `attachment; filename="${name}"` } };
   });
   route('POST', /^\/api\/export\/sheets$/, async (req) => {
     const b = await readJson(req);
     const c = config.load();
     if (!c.sheetsWebhookUrl) throw Object.assign(new Error('Add your Google Sheets web app URL in Settings first.'), { status: 400 });
-    const month = b.month;
-    const tx = queryTransactions(db, { month });
-    const s = month ? summary(db, month) : null;
+    const q = { month: b.month, from: b.from, to: b.to };
+    const range = dateRange(q);
+    const tx = queryTransactions(db, q);
+    const s = range ? summary(db, q) : null;
+    // The tab name in the sheet: the month, or a label like "2026", "2026 YTD" or "2026-03-01 to 2026-05-15".
+    const label = b.month || (range && (String(b.label || '').replace(/[:\\/?*\[\]]/g, '-').slice(0, 80) || `${range[0]} to ${range[1]}`)) || 'all';
     const result = await postToSheet(c.sheetsWebhookUrl, {
       secret: c.sheetsSecret,
-      month: month || 'all',
+      month: label,
       transactions: tx.map((r) => ({
         date: r.date, description: r.description, counterparty: r.counterparty, amount: r.amount,
         category: r.category, tags: r.tags, note: r.note, account: `${r.institution || ''} ${r.account_name || ''}`.trim(),

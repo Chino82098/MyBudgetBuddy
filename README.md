@@ -6,8 +6,11 @@ A personal budgeting desktop app that pulls your bank data from the [Plaid API](
 
 - **Sync** accounts, balances and transactions from any bank Plaid supports
 - **Quick updates:** edit category, tags and notes inline. Press Enter to save and jump to the next row, or bulk-tag selected rows.
+- **Your own categories:** pick from the Category list on any row or choose **＋ New category…** to make one. Rename, merge or delete them under **Settings → Categories**.
+- **Remembers your choices:** a category you set is never changed by a sync, even when a pending charge posts under a new ID. New transactions from that merchant get the same category automatically. Change older ones in one click, or forget a merchant under **Settings → Remembered merchants**.
 - **Budgets** per category with progress bars, plus spending by tag (e.g. `work-trip`, `gift`)
-- **Export** a month to Google Sheets in one click, or download a CSV
+- **View** a month, a full year, year-to-date, or any custom date range (budgets scale to the length of the range)
+- **Export** the period you're viewing to Google Sheets in one click, or download a CSV
 - Everything is stored **locally** in SQLite. Your edits are never overwritten by a re-sync.
 
 ![stack](https://img.shields.io/badge/node-%E2%89%A522.13-green) No runtime dependencies. Electron is only needed for the desktop window.
@@ -59,14 +62,14 @@ Teller connections now show as **retired**. They no longer sync, but their trans
 2. Paste in the contents of [`google-sheets/Code.gs`](google-sheets/Code.gs). Change `SECRET` to a random string.
 3. **Deploy → New deployment → Web app**. Set *Execute as*: **Me** and *Who has access*: **Anyone**. Authorize it.
 4. Copy the web app URL (ends in `/exec`). In Budget Buddy **Settings**, paste the URL and the same secret.
-5. Click **Export to Google Sheets**. Each export writes a tab for the month (e.g. `2026-11`) and a `2026-11 summary` tab, replacing older exports of that month.
+5. Click **Export to Google Sheets**. Each export writes a tab for the period you're viewing (e.g. `2026-11`, `2026`, `2026 YTD` or `2026-03-01 to 2026-05-15`) and a matching `… summary` tab, replacing older exports of that period.
 
 ## How the numbers work
 
 - Negative amounts are money out, positive amounts are money in. If a credit card shows purchases as positive, tick **Flip signs** for that account under Accounts.
 - **Spending/Income** leave out anything categorized `Transfer`, so card payments and moves between your own accounts aren't double counted. They also leave out any row with **Skip** ticked. Plaid's transfer and credit-card-payment categories default to `Transfer`; recategorize any that are real spending (e.g. Zelle rent). Plaid reports money out as positive; Budget Buddy flips it so spending is negative everywhere, so **Flip signs** is rarely needed now.
 - Hidden accounts are left out everywhere.
-- Shortcuts: `←`/`→` change month, `/` jumps to search.
+- Shortcuts: `←`/`→` step back/forward a month (or a year in 1 Year and YTD views), `/` jumps to search.
 
 ## Where your data lives
 

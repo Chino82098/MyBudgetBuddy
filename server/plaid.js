@@ -70,6 +70,13 @@ function createClient(config, fetchImpl = globalThis.fetch) {
       }),
     exchangePublicToken: (publicToken) => call('/item/public_token/exchange', { public_token: publicToken }),
     getAccounts: (accessToken) => call('/accounts/get', { access_token: accessToken }),
+    // Real-time balances. Capital One requires min_last_updated_datetime for credit cards (it has no
+    // real-time card balance); every other bank and account type ignores it.
+    getBalances: (accessToken, maxAgeDays = 30) =>
+      call('/accounts/balance/get', {
+        access_token: accessToken,
+        options: { min_last_updated_datetime: new Date(Date.now() - maxAgeDays * 86400000).toISOString() },
+      }),
     transactionsSync: (accessToken, cursor) =>
       call('/transactions/sync', { access_token: accessToken, count: 500, ...(cursor ? { cursor } : {}) }),
     removeItem: (accessToken) => call('/item/remove', { access_token: accessToken }),

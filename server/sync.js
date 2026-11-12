@@ -1,7 +1,9 @@
 'use strict';
 // Pulls accounts, balances and transactions from Plaid into SQLite using /transactions/sync.
-// User-edited fields (category, tags, note, exclude) are never overwritten.
+// User-edited fields (category, tags, note, exclude) are never overwritten. New transactions from a
+// merchant you've categorized before get that category ("remembered merchants").
 const { RECONNECT_CODES } = require('./plaid');
+const categories = require('./categories');
 
 const MAX_PAGES = 400;
 const MAX_RESTARTS = 3;
@@ -72,9 +74,12 @@ function makeStatements(db) {
       ON CONFLICT(id) DO UPDATE SET account_id=excluded.account_id, date=excluded.date, amount=excluded.amount,
         description=excluded.description, counterparty=excluded.counterparty,
         bank_category=excluded.bank_category, type=excluded.type, status=excluded.status`),
-    getEdits: db.prepare('SELECT category, tags, note, exclude, updated_at FROM transactions WHERE id=?'),
+    exists: db.prepare('SELECT 1 FROM transactions WHERE id=?'),
+    getEdits: db.prepare(
+      'SELECT id, account_id, date, amount, counterparty, description, category, category_manual, tags, note, exclude, updated_at FROM transactions WHERE id=?'
+    ),
     copyEdits: db.prepare(
-      `UPDATE transactions SET category=?, tags=?, note=?, exclude=?, updated_at=? WHERE id=?`
+      `UPDATE transactions SET category=?, category_manual=?, tags=?, note=?, exclude=?, updated_at=? WHERE id=?`
     ),
     deleteTx: db.prepare('DELETE FROM transactions WHERE id=?'),
     setCursor: db.prepare('UPDATE enrollments SET cursor=? WHERE id=?'),
@@ -85,7 +90,33 @@ function makeStatements(db) {
 }
 
 function hasEdits(row) {
-  return row && (row.updated_at || row.tags || row.note || row.exclude);
+  return row && (row.updated_at || row.category_manual || row.tags || row.note || row.exclude);
+}
+
+const copyEditsTo = (st, from, toId) =>
+  st.copyEdits.run(from.category, from.category_manual || 0, from.tags, from.note, from.exclude, from.updated_at, toId);
+
+// Some banks post a pending charge under a new id without saying which pending one it replaces.
+// Before an edited transaction is deleted, move its edits to the closest new one on the same
+// account: same merchant or same amount, within 10 days.
+function rehome(st, gone, fresh) {
+  const key = categories.merchantKey(gone);
+  const when = Date.parse(gone.date);
+  let best = null;
+  let bestScore = Infinity;
+  for (const row of fresh) {
+    if (row.account_id !== gone.account_id || row.claimed) continue;
+    const gap = Math.abs(Date.parse(row.date) - when) / 86400000;
+    const sameAmt = Math.round(row.amount * 100) === Math.round(gone.amount * 100);
+    const sameMerchant = key && categories.merchantKey(row) === key;
+    if (gap > 10 || !(sameAmt || sameMerchant)) continue;
+    const score = gap + (sameAmt ? 0 : 5) + (sameMerchant ? 0 : 5);
+    if (score < bestScore) [best, bestScore] = [row, score];
+  }
+  if (!best || hasEdits(st.getEdits.get(best.id))) return false;
+  best.claimed = true;
+  copyEditsTo(st, gone, best.id);
+  return true;
 }
 
 // Reads every page from the stored cursor. If Plaid says the data changed mid-way, start over.
@@ -110,17 +141,39 @@ async function fetchChanges(client, token, startCursor) {
   }
 }
 
+// Prefer real-time balances (/accounts/balance/get): some banks, e.g. Capital One, leave `available`
+// empty in the cached /accounts/get data. If that call fails for any reason other than a needed
+// re-login, fall back to the cached data so the sync still runs.
+async function fetchAccounts(client, token) {
+  if (client.getBalances) {
+    try {
+      return await client.getBalances(token);
+    } catch (e) {
+      if (RECONNECT_CODES.has(e.code)) throw e;
+    }
+  }
+  return client.getAccounts(token);
+}
+
+// Banks don't always report `available`. For credit cards it is the limit minus what's owed.
+function availableBalance(acc) {
+  const b = acc.balances || {};
+  if (b.available != null) return b.available;
+  if (acc.type === 'credit' && b.limit != null && b.current != null) return b.limit - b.current;
+  return null;
+}
+
 async function syncEnrollment(db, client, enrollment) {
   const st = makeStatements(db);
   const summary = { enrollment: enrollment.id, institution: enrollment.institution, accounts: 0, transactions: 0 };
   try {
-    const { accounts } = await client.getAccounts(enrollment.access_token);
+    const { accounts } = await fetchAccounts(client, enrollment.access_token);
     for (const acc of accounts || []) {
       const b = acc.balances || {};
       st.upsertAccount.run(
         acc.account_id, enrollment.id, acc.name || acc.official_name, enrollment.institution,
         acc.type, acc.subtype, acc.mask, b.iso_currency_code || b.unofficial_currency_code || 'USD',
-        b.available ?? null, b.current ?? null
+        availableBalance(acc), b.current ?? null
       );
       summary.accounts++;
     }
@@ -129,21 +182,31 @@ async function syncEnrollment(db, client, enrollment) {
     const ch = await fetchChanges(client, enrollment.access_token, enrollment.cursor);
     db.exec('BEGIN');
     try {
+      const fresh = []; // rows that didn't exist before this sync
       for (const tx of [...ch.added, ...ch.modified]) {
         if (!known.has(tx.account_id)) continue;
         const row = toRow(tx);
+        const isNew = !st.exists.get(row.id);
+        // The category only applies to new rows; an existing row keeps whatever it has.
+        const category = (isNew && categories.ruleFor(db, row)) || defaultCategory(tx);
         st.upsertTx.run(row.id, row.account_id, row.date, row.amount, row.description, row.counterparty,
-          row.bank_category, row.type, row.status, defaultCategory(tx));
+          row.bank_category, row.type, row.status, category);
+        if (isNew) fresh.push(row);
         // A posted transaction replaces its pending version: keep the user's edits from the pending row.
         if (tx.pending_transaction_id && tx.pending_transaction_id !== row.id) {
           const prev = st.getEdits.get(tx.pending_transaction_id);
           if (hasEdits(prev) && !hasEdits(st.getEdits.get(row.id))) {
-            st.copyEdits.run(prev.category, prev.tags, prev.note, prev.exclude, prev.updated_at, row.id);
+            copyEditsTo(st, prev, row.id);
+            row.claimed = true;
           }
           if (prev) st.deleteTx.run(tx.pending_transaction_id);
         }
       }
-      for (const r of ch.removed) st.deleteTx.run(r.transaction_id);
+      for (const r of ch.removed) {
+        const gone = st.getEdits.get(r.transaction_id);
+        if (hasEdits(gone)) rehome(st, gone, fresh);
+        st.deleteTx.run(r.transaction_id);
+      }
       st.setCursor.run(ch.cursor || null, enrollment.id);
       db.exec('COMMIT');
     } catch (e) {
@@ -179,9 +242,9 @@ function carryOverFromTeller(db, enrollmentId) {
 
   const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const txOf = db.prepare(
-    `SELECT id, date, amount, category, tags, note, exclude, updated_at FROM transactions WHERE account_id=?`
+    `SELECT id, date, amount, category, category_manual, tags, note, exclude, updated_at FROM transactions WHERE account_id=?`
   );
-  const copy = db.prepare(`UPDATE transactions SET category=?, tags=?, note=?, exclude=?, updated_at=? WHERE id=?`);
+  const copy = db.prepare(`UPDATE transactions SET category=?, category_manual=?, tags=?, note=?, exclude=?, updated_at=? WHERE id=?`);
   const del = db.prepare('DELETE FROM transactions WHERE id=?');
   const cents = (amt, invert) => Math.round((invert ? -amt : amt) * 100);
   let moved = 0;
@@ -215,7 +278,8 @@ function carryOverFromTeller(db, enrollmentId) {
         if (best < 0) continue;
         const [match] = list.splice(best, 1);
         if (hasEdits(old) && !hasEdits(match)) {
-          copy.run(old.category, old.tags, old.note, old.exclude, old.updated_at || new Date().toISOString(), match.id);
+          copy.run(old.category, old.category_manual || 0, old.tags, old.note, old.exclude,
+            old.updated_at || new Date().toISOString(), match.id);
         }
         del.run(old.id);
         moved++;

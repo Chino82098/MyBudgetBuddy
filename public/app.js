@@ -6,7 +6,15 @@ const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const money = (n) => (n < 0 ? '-' : '') + '$' + Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-const state = { month: new Date().toISOString().slice(0, 7), view: 'dashboard', tx: [], selected: new Set(), meta: { categories: [], tags: [], budgets: [] } };
+// Local calendar date as YYYY-MM-DD (toISOString would give tomorrow's date late in the evening).
+const localISO = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const lastOfMonth = (ym) => { const [y, m] = ym.split('-').map(Number); return new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10); };
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const niceDate = (iso, withYear = true) => `${MONTHS[Number(iso.slice(5, 7)) - 1]} ${Number(iso.slice(8))}${withYear ? `, ${iso.slice(0, 4)}` : ''}`;
+
+const state = { month: localISO().slice(0, 7), view: 'dashboard',
+  // Date range: mode is month | year | ytd | custom. year is used by "1 Year" and "YTD"; from/to by "Custom".
+  range: { mode: 'month', year: new Date().getFullYear(), from: '', to: '' }, tx: [], selected: new Set(), meta: { categories: [], tags: [], budgets: [] } };
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -38,17 +46,79 @@ function show(view) {
   state.view = view;
   $$('.view').forEach((v) => v.classList.toggle('active', v.id === `view-${view}`));
   $$('nav a').forEach((a) => a.classList.toggle('active', a.dataset.view === view));
-  ({ dashboard: loadDashboard, transactions: loadTransactions, accounts: loadAccounts, settings: loadSettings })[view]();
+  const loaders = { dashboard: loadDashboard, transactions: loadTransactions, categories: loadCategoryManager,
+    accounts: loadAccounts, export: loadExport, settings: loadSettings };
+  (loaders[view] || loadDashboard)();
 }
 window.addEventListener('hashchange', () => show(location.hash.slice(1) || 'dashboard'));
 
-function setMonth(m) {
-  state.month = m;
-  $('#month').value = m;
+// ---------- date range ----------
+// The range being viewed: { from, to, label, month? } (month only in Month mode).
+function currentRange() {
+  const r = state.range;
+  if (r.mode === 'year') return { from: `${r.year}-01-01`, to: `${r.year}-12-31`, label: String(r.year) };
+  if (r.mode === 'ytd') {
+    // Same stretch of the year as today, so last year's YTD compares like for like.
+    const today = localISO();
+    let to = `${r.year}${today.slice(4)}`;
+    if (to.endsWith('02-29') && !(r.year % 4 === 0 && (r.year % 100 !== 0 || r.year % 400 === 0))) to = `${r.year}-02-28`;
+    return { from: `${r.year}-01-01`, to, label: `${r.year} YTD` };
+  }
+  if (r.mode === 'custom' && r.from && r.to) {
+    const [from, to] = r.from <= r.to ? [r.from, r.to] : [r.to, r.from];
+    return { from, to, label: `${from} to ${to}` };
+  }
+  return { from: `${state.month}-01`, to: lastOfMonth(state.month), label: state.month, month: state.month };
+}
+function setRangeParams(p, r = currentRange()) {
+  if (r.month) p.set('month', r.month);
+  else { p.set('from', r.from); p.set('to', r.to); }
+  return p;
+}
+function saveRange() {
+  try { localStorage.setItem('bb.range', JSON.stringify({ mode: state.range.mode, from: state.range.from, to: state.range.to })); } catch {}
+}
+function renderRangeControls() {
+  const r = state.range;
+  $('#rangeMode').value = r.mode;
+  $('#month').classList.toggle('hidden', r.mode !== 'month');
+  $('#customRange').classList.toggle('hidden', r.mode !== 'custom');
+  $('#rangeLabel').classList.toggle('hidden', r.mode !== 'year' && r.mode !== 'ytd');
+  $('#prevMonth').classList.toggle('hidden', r.mode === 'custom');
+  $('#nextMonth').classList.toggle('hidden', r.mode === 'custom');
+  const unit = r.mode === 'month' ? 'month' : 'year';
+  $('#prevMonth').title = `Previous ${unit}`;
+  $('#nextMonth').title = `Next ${unit}`;
+  $('#month').value = state.month;
+  $('#fromDate').value = r.from;
+  $('#toDate').value = r.to;
+  if (r.mode === 'year') $('#rangeLabel').textContent = String(r.year);
+  if (r.mode === 'ytd') { const c = currentRange(); $('#rangeLabel').textContent = `${niceDate(c.from, false)} – ${niceDate(c.to)}`; }
+}
+function refreshRange() {
+  renderRangeControls();
+  saveRange();
   if (state.view === 'dashboard') loadDashboard();
   if (state.view === 'transactions') loadTransactions();
+  if (state.view === 'export') loadExport();
+}
+function setRangeMode(mode) {
+  const prev = currentRange();
+  const r = state.range;
+  if (mode === 'custom' && (!r.from || !r.to)) { r.from = prev.from; r.to = prev.to; }
+  if (mode === 'year' || mode === 'ytd') r.year = r.mode === 'month' ? Number(state.month.slice(0, 4)) : r.year;
+  if (mode === 'ytd' && r.mode !== 'year') r.year = new Date().getFullYear();
+  r.mode = mode;
+  refreshRange();
+}
+function setMonth(m) {
+  state.month = m;
+  refreshRange();
 }
 function shiftMonth(delta) {
+  const r = state.range;
+  if (r.mode === 'custom') return;
+  if (r.mode === 'year' || r.mode === 'ytd') { r.year += delta; return refreshRange(); }
   const [y, m] = state.month.split('-').map(Number);
   const d = new Date(Date.UTC(y, m - 1 + delta, 1));
   setMonth(d.toISOString().slice(0, 7));
@@ -65,11 +135,46 @@ async function loadMeta() {
   };
   fill($('#fCategory'), state.meta.categories, 'All categories');
   fill($('#fTag'), state.meta.tags, 'All tags');
+  $('#bulkCat').innerHTML = '<option value="">set category…</option>' + catOptions('');
+}
+
+// <option>s for a category picker: every category, the current one (even if unknown), and "New category…".
+const NEW_CAT = '__new__';
+function catOptions(current) {
+  const names = [...state.meta.categories];
+  if (current && !names.includes(current)) names.push(current);
+  return names.map((c) => `<option value="${esc(c)}"${c === current ? ' selected' : ''}>${esc(c)}</option>`).join('') +
+    `<option value="${NEW_CAT}">＋ New category…</option>`;
+}
+
+// Swaps a category <select> for a text box to type a new category. Resolves with the name, or null if cancelled.
+function askNewCategory(select, restoreTo) {
+  return new Promise((resolve) => {
+    const input = document.createElement('input');
+    input.className = 'new-cat';
+    input.placeholder = 'New category, then Enter';
+    input.maxLength = 60;
+    select.replaceWith(input);
+    input.focus();
+    let done = false;
+    const finish = (val) => {
+      if (done) return;
+      done = true;
+      select.value = restoreTo;
+      input.replaceWith(select);
+      resolve(val && val.trim() ? val.trim() : null);
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); finish(input.value); }
+      if (e.key === 'Escape') { e.preventDefault(); finish(null); }
+    });
+    input.addEventListener('blur', () => finish(input.value));
+  });
 }
 
 // ---------- dashboard ----------
 async function loadDashboard() {
-  const s = await api(`/api/summary?month=${state.month}`);
+  const s = await api(`/api/summary?${setRangeParams(new URLSearchParams())}`);
   $('#tIncome').textContent = money(s.income);
   $('#tSpending').textContent = money(s.spending);
   $('#tNet').textContent = money(s.net);
@@ -87,7 +192,9 @@ async function loadDashboard() {
           <div class="cat-amt">${money(c.spent)} <span class="budget" data-budget="${esc(c.category)}">${c.budget ? `of ${money(c.budget)}` : '+ budget'}</span></div>
         </div>`;
       }).join('')
-    : '<div class="empty">No spending this month yet. Connect a bank or load demo data from Accounts.</div>';
+    : '<div class="empty">No spending in this period yet. Connect a bank or load demo data from Accounts.</div>';
+  $('#budgetHint').textContent = s.months === 1 ? 'click a budget to edit it'
+    : `budgets × ${s.months} months · click one to edit the monthly amount`;
 
   $('#tagList').innerHTML = s.byTag.length
     ? s.byTag.map((t) => `<div class="tag-row" data-tag="${esc(t.tag)}"><span class="chip">${esc(t.tag)}</span><span>${money(t.spent)} · ${t.count} txn</span></div>`).join('')
@@ -96,19 +203,37 @@ async function loadDashboard() {
   drawDaily(s);
 }
 
+// Bars for every day (short ranges) or every month (long ranges) between s.from and s.to.
 function drawDaily(s) {
-  const [y, m] = s.month.split('-').map(Number);
-  const days = new Date(Date.UTC(y, m, 0)).getUTCDate();
-  const map = Object.fromEntries(s.daily.map((d) => [Number(d.date.slice(8)), d.spent]));
-  const max = Math.max(1, ...Object.values(map));
-  const W = 700, H = 140, pad = 18, bw = (W - 10) / days;
-  let bars = '';
-  for (let d = 1; d <= days; d++) {
-    const v = map[d] || 0;
-    const h = (v / max) * (H - pad - 6);
-    bars += `<rect x="${5 + (d - 1) * bw + 1}" y="${H - pad - h}" width="${Math.max(1, bw - 2)}" height="${h}" rx="2"><title>${s.month}-${String(d).padStart(2, '0')}: ${money(v)}</title></rect>`;
-    if (d === 1 || d % 5 === 0) bars += `<text x="${5 + (d - 1) * bw + bw / 2}" y="${H - 4}" text-anchor="middle">${d}</text>`;
+  const byMonth = s.granularity === 'month';
+  $('#chartTitle').textContent = byMonth ? 'Monthly spending' : 'Daily spending';
+  const keys = [];
+  if (byMonth) {
+    let [y, m] = s.from.split('-').map(Number);
+    for (let k = `${y}-${String(m).padStart(2, '0')}`; k <= s.to.slice(0, 7); k = `${y}-${String(m).padStart(2, '0')}`) {
+      keys.push(k);
+      if (++m > 12) { m = 1; y++; }
+    }
+  } else {
+    for (let t = Date.parse(s.from + 'T00:00:00Z'); t <= Date.parse(s.to + 'T00:00:00Z'); t += 86400000) keys.push(new Date(t).toISOString().slice(0, 10));
   }
+  const map = Object.fromEntries(s.daily.map((d) => [d.date, d.spent]));
+  const max = Math.max(1, ...Object.values(map));
+  const n = keys.length, W = 700, H = 140, pad = 18, bw = (W - 10) / n;
+  const multiYear = s.from.slice(0, 4) !== s.to.slice(0, 4);
+  const oneMonth = !byMonth && s.from.slice(0, 7) === s.to.slice(0, 7);
+  const every = byMonth ? Math.ceil(n / 12) : oneMonth ? 5 : Math.ceil(n / 8);
+  const label = (k, i) => byMonth ? MONTHS[Number(k.slice(5, 7)) - 1] + (multiYear && (i === 0 || k.endsWith('-01')) ? ` ’${k.slice(2, 4)}` : '')
+    : oneMonth ? String(Number(k.slice(8))) : niceDate(k, false);
+  const tip = (k) => byMonth ? `${MONTHS[Number(k.slice(5, 7)) - 1]} ${k.slice(0, 4)}` : k;
+  let bars = '';
+  keys.forEach((k, i) => {
+    const v = map[k] || 0;
+    const h = (v / max) * (H - pad - 6);
+    bars += `<rect x="${5 + i * bw + 1}" y="${H - pad - h}" width="${Math.max(1, bw - 2)}" height="${h}" rx="2"><title>${tip(k)}: ${money(v)}</title></rect>`;
+    const show = oneMonth ? (i === 0 || (i + 1) % 5 === 0) : i % every === 0;
+    if (show) bars += `<text x="${5 + i * bw + bw / 2}" y="${H - 4}" text-anchor="middle">${label(k, i)}</text>`;
+  });
   $('#dailyChart').innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${bars}</svg>`;
 }
 
@@ -140,10 +265,11 @@ $('#addBudget').addEventListener('submit', async (e) => {
 });
 
 // ---------- transactions ----------
-function txQuery() {
+function txQuery({ allTime = $('#fAllTime').checked } = {}) {
   const p = new URLSearchParams();
-  if (!$('#fAllTime').checked) p.set('month', state.month);
+  if (!allTime) setRangeParams(p);
   if ($('#fSearch').value) p.set('q', $('#fSearch').value);
+  if ($('#fAmount').value.trim()) p.set('amount', $('#fAmount').value.trim());
   if ($('#fAccount').value) p.set('account', $('#fAccount').value);
   if ($('#fCategory').value) p.set('category', $('#fCategory').value);
   if ($('#fTag').value) p.set('tag', $('#fTag').value);
@@ -151,9 +277,12 @@ function txQuery() {
   return p.toString();
 }
 
-async function loadTransactions() {
+// keepSelection: leave the same rows ticked after a reload (used by the bulk bar so several
+// actions can be applied to one selection). Rows that no longer match the filters drop out.
+async function loadTransactions({ keepSelection = false } = {}) {
   state.tx = await api(`/api/transactions?${txQuery()}`);
-  state.selected.clear();
+  const ids = new Set(state.tx.map((t) => t.id));
+  state.selected = keepSelection ? new Set([...state.selected].filter((id) => ids.has(id))) : new Set();
   renderTx();
 }
 
@@ -165,7 +294,7 @@ function renderTx() {
       <td class="date">${esc(t.date)}</td>
       <td class="desc"><div class="main" title="${esc(t.description)}">${esc(t.counterparty || t.description)}${t.status === 'pending' ? '<span class="pending">pending</span>' : ''}</div>
         <div class="sub">${esc(t.counterparty ? t.description : '')} · ${esc(t.account_name)}</div></td>
-      <td class="cat"><input data-f="category" list="categoryOptions" value="${esc(t.category)}"></td>
+      <td class="cat"><select data-f="category" title="Category">${catOptions(t.category)}</select></td>
       <td class="tags"><input data-f="tags" value="${esc(t.tags.split(',').filter(Boolean).join(', '))}" placeholder="add tags"></td>
       <td class="note"><input data-f="note" value="${esc(t.note)}" placeholder="add a note"></td>
       <td class="num ${t.amount < 0 ? '' : 'pos'}">${money(t.amount)}</td>
@@ -173,7 +302,7 @@ function renderTx() {
     </tr>`).join('');
   const empty = $('#txEmpty');
   empty.classList.toggle('hidden', state.tx.length > 0);
-  empty.textContent = 'No transactions match. Try “All months”, clear filters, or Sync.';
+  empty.textContent = 'No transactions match. Try “All dates”, clear filters, or Sync.';
   updateBulk();
 }
 
@@ -181,8 +310,12 @@ async function saveField(input) {
   const tr = input.closest('tr');
   const id = tr.dataset.id;
   const field = input.dataset.f;
-  const value = field === 'exclude' ? input.checked : input.value;
   const tx = state.tx.find((t) => t.id === id);
+  let value = field === 'exclude' ? input.checked : input.value;
+  if (field === 'category' && value === NEW_CAT) {
+    value = await askNewCategory(input, tx.category);
+    if (!value) return;
+  }
   const prev = field === 'exclude' ? !!tx.exclude : field === 'tags' ? tx.tags.split(',').filter(Boolean).join(', ') : tx[field];
   if (prev === value) return;
   try {
@@ -193,10 +326,36 @@ async function saveField(input) {
     input.closest('td').classList.remove('saved');
     void input.offsetWidth;
     input.closest('td').classList.add('saved');
-    if (field === 'tags' || field === 'category') loadMeta();
+    if (field === 'tags') loadMeta();
+    if (field === 'category') {
+      const isNew = !state.meta.categories.includes(out.category);
+      await loadMeta();
+      // A brand-new category has to show up in every row's list, not just this one.
+      if (isNew) {
+        $$('select[data-f="category"]', $('#txTable tbody')).forEach((sel) => {
+          sel.innerHTML = catOptions(state.tx.find((t) => t.id === sel.closest('tr').dataset.id).category);
+        });
+      } else input.value = out.category;
+      if (out.similar > 0) offerApplySimilar(id, out);
+    }
   } catch (e) {
     toast(e.message, true);
   }
+}
+
+function offerApplySimilar(id, out) {
+  const n = out.similar;
+  toast(`Saved. New “${esc(out.merchantName)}” transactions will be ${esc(out.category)} too. ` +
+    `<button class="link" id="applySimilar">Change ${n} older one${n === 1 ? '' : 's'}</button>`, false, true);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => $('#toast').classList.add('hidden'), 9000);
+  $('#applySimilar').addEventListener('click', async () => {
+    try {
+      const r = await api(`/api/transactions/${encodeURIComponent(id)}/apply-to-similar`, { method: 'POST' });
+      toast(`Changed ${r.updated} transaction${r.updated === 1 ? '' : 's'} to ${r.category}`);
+      loadTransactions();
+    } catch (e) { toast(e.message, true); }
+  });
 }
 
 const tbody = $('#txTable tbody');
@@ -221,23 +380,166 @@ function updateBulk() {
   $('#bulkBar').classList.toggle('hidden', state.selected.size === 0);
   $('#bulkCount').textContent = `${state.selected.size} selected`;
   $('#selAll').checked = state.tx.length > 0 && state.selected.size === state.tx.length;
+  $('#bulkUntagMenu').classList.add('hidden');
 }
 $('#selAll').addEventListener('change', (e) => {
   state.selected = new Set(e.target.checked ? state.tx.map((t) => t.id) : []);
   renderTx();
 });
-async function bulk(body) {
+async function bulk(body, msg) {
   await api('/api/transactions/bulk', { method: 'POST', body: { ids: [...state.selected], ...body } });
-  toast(`Updated ${state.selected.size} transactions`);
+  toast(msg || `Updated ${state.selected.size} transactions`);
   await loadMeta();
-  loadTransactions();
+  await loadTransactions({ keepSelection: true });
 }
-$('#bulkTagBtn').addEventListener('click', () => $('#bulkTag').value && bulk({ addTags: $('#bulkTag').value }));
-$('#bulkCatBtn').addEventListener('click', () => $('#bulkCat').value && bulk({ category: $('#bulkCat').value }));
+$('#bulkTagBtn').addEventListener('click', async () => {
+  const input = $('#bulkTag');
+  if (!input.value.trim()) return;
+  try {
+    await bulk({ addTags: input.value });
+    input.value = '';
+  } catch (e) { toast(e.message, true); }
+});
+$('#bulkCat').addEventListener('change', async (e) => {
+  if (e.target.value !== NEW_CAT) return;
+  const sel = e.target;
+  const name = await askNewCategory(sel, '');
+  if (name) {
+    sel.insertAdjacentHTML('beforeend', `<option value="${esc(name)}">${esc(name)}</option>`);
+    sel.value = name;
+  }
+});
+$('#bulkCatBtn').addEventListener('click', () => $('#bulkCat').value && $('#bulkCat').value !== NEW_CAT && bulk({ category: $('#bulkCat').value }));
 $('#bulkClear').addEventListener('click', () => { state.selected.clear(); renderTx(); });
+$('#bulkTag').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('#bulkTagBtn').click(); } });
+
+// ---------- bulk: remove tags ----------
+// Lists the tags found on the selected transactions (with how many have each) so they can be removed in one go.
+function tagsOnSelected() {
+  const counts = new Map();
+  for (const t of state.tx) {
+    if (!state.selected.has(t.id)) continue;
+    for (const tag of t.tags.split(',').filter(Boolean)) counts.set(tag, (counts.get(tag) || 0) + 1);
+  }
+  return [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+}
+$('#bulkUntagBtn').addEventListener('click', () => {
+  const menu = $('#bulkUntagMenu');
+  if (!menu.classList.contains('hidden')) return menu.classList.add('hidden');
+  const tags = tagsOnSelected();
+  menu.innerHTML = tags.length
+    ? tags.map(([tag, n]) => `<button data-tag="${esc(tag)}" role="menuitem"><span>${esc(tag)}</span><span class="count">${n}</span></button>`).join('') +
+      `<hr><button data-all="1" class="danger" role="menuitem">Remove all tags</button>`
+    : '<div class="empty-note">The selected transactions have no tags.</div>';
+  menu.classList.remove('hidden');
+});
+$('#bulkUntagMenu').addEventListener('click', (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  $('#bulkUntagMenu').classList.add('hidden');
+  const n = state.selected.size;
+  const label = `${n} transaction${n === 1 ? '' : 's'}`;
+  if (btn.dataset.all) bulk({ clearTags: true }, `Removed all tags from ${label}`);
+  else bulk({ removeTags: btn.dataset.tag }, `Removed “${btn.dataset.tag}” from ${label}`);
+});
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.menu-wrap')) $('#bulkUntagMenu').classList.add('hidden');
+});
+
+// ---------- tag suggestions ----------
+// While typing in any tag box (the bulk bar or a row's Tags cell), show existing tags that match the word being typed.
+// ↑/↓ to move, Enter or Tab to pick, Esc to close.
+const tagNorm = (t) => t.trim().toLowerCase().replace(/\s+/g, '-');
+const suggest = { box: null, input: null, items: [], active: 0 };
+const isTagInput = (el) => !!el && el.tagName === 'INPUT' && (el.id === 'bulkTag' || el.dataset.f === 'tags');
+
+// The comma-separated piece of the box the caret is in.
+function tagToken(input) {
+  const v = input.value;
+  const caret = input.selectionStart ?? v.length;
+  const start = v.lastIndexOf(',', caret - 1) + 1;
+  let end = v.indexOf(',', caret);
+  if (end < 0) end = v.length;
+  return { start, end, word: tagNorm(v.slice(start, end)) };
+}
+
+function hideSuggestions() {
+  suggest.box?.remove();
+  Object.assign(suggest, { box: null, input: null, items: [], active: 0 });
+}
+
+function showSuggestions(input) {
+  const { word } = tagToken(input);
+  if (!word) return hideSuggestions();
+  const already = new Set(input.value.split(',').map(tagNorm).filter(Boolean));
+  const matches = state.meta.tags.filter((t) => t !== word && !already.has(t) && t.includes(word));
+  matches.sort((a, b) => (b.startsWith(word) - a.startsWith(word)) || a.localeCompare(b));
+  const items = matches.slice(0, 8);
+  if (!items.length) return hideSuggestions();
+  if (!suggest.box) {
+    suggest.box = document.createElement('div');
+    suggest.box.className = 'tag-suggest';
+    suggest.box.setAttribute('role', 'listbox');
+    // mousedown would blur the box (and save the row) before the click lands, so keep focus where it is.
+    suggest.box.addEventListener('mousedown', (e) => e.preventDefault());
+    suggest.box.addEventListener('click', (e) => {
+      const el = e.target.closest('[data-i]');
+      if (el) pickSuggestion(Number(el.dataset.i));
+    });
+    document.body.appendChild(suggest.box);
+  }
+  suggest.input = input;
+  suggest.items = items;
+  suggest.active = 0;
+  const hl = (t) => { const i = t.indexOf(word); return esc(t.slice(0, i)) + `<b>${esc(word)}</b>` + esc(t.slice(i + word.length)); };
+  suggest.box.innerHTML = items.map((t, i) => `<div data-i="${i}" role="option"${i === 0 ? ' class="active"' : ''}>${hl(t)}</div>`).join('');
+  const r = input.getBoundingClientRect();
+  suggest.box.style.left = `${r.left}px`;
+  suggest.box.style.top = `${r.bottom + 4}px`;
+  suggest.box.style.minWidth = `${Math.max(r.width, 160)}px`;
+}
+
+function moveSuggestion(step) {
+  const n = suggest.items.length;
+  suggest.active = (suggest.active + step + n) % n;
+  $$('[data-i]', suggest.box).forEach((el, i) => el.classList.toggle('active', i === suggest.active));
+  $$('[data-i]', suggest.box)[suggest.active].scrollIntoView({ block: 'nearest' });
+}
+
+function pickSuggestion(i) {
+  const input = suggest.input;
+  const tag = suggest.items[i];
+  if (!input || !tag) return;
+  const { start, end } = tagToken(input);
+  const v = input.value;
+  const before = v.slice(0, start);
+  const rest = v.slice(end).replace(/^\s*,?\s*/, '');
+  const head = `${before}${start > 0 ? ' ' : ''}${tag}, `;
+  input.value = head + rest;
+  input.setSelectionRange(head.length, head.length);
+  hideSuggestions();
+  input.focus();
+}
+
+document.addEventListener('input', (e) => { if (isTagInput(e.target)) showSuggestions(e.target); });
+document.addEventListener('focusout', (e) => { if (e.target === suggest.input) hideSuggestions(); });
+// Capture phase, so picking a suggestion with Enter doesn't also save the row / jump to the next one.
+document.addEventListener('keydown', (e) => {
+  if (!suggest.box || e.target !== suggest.input) return;
+  const keys = { ArrowDown: () => moveSuggestion(1), ArrowUp: () => moveSuggestion(-1),
+    Enter: () => pickSuggestion(suggest.active), Tab: () => pickSuggestion(suggest.active), Escape: hideSuggestions };
+  if (!keys[e.key]) return;
+  e.preventDefault();
+  e.stopPropagation();
+  keys[e.key]();
+}, true);
+window.addEventListener('scroll', hideSuggestions, true);
+window.addEventListener('resize', hideSuggestions);
 
 let searchTimer;
-$('#fSearch').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(loadTransactions, 250); });
+for (const id of ['#fSearch', '#fAmount']) {
+  $(id).addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(loadTransactions, 250); });
+}
 ['#fAccount', '#fCategory', '#fTag', '#fUntagged', '#fAllTime'].forEach((s) => $(s).addEventListener('change', loadTransactions));
 
 // ---------- accounts ----------
@@ -338,9 +640,36 @@ async function runSync() {
   show(state.view);
 }
 $('#syncBtn').addEventListener('click', (e) => busy(e.target, runSync));
-$('#csvBtn').addEventListener('click', () => { location.href = `/api/export.csv?${txQuery()}`; });
+// ---------- export tab ----------
+// Plain-English list of the Transactions-page filters that are currently set.
+function activeFilters() {
+  const out = [];
+  const sel = (id) => { const el = $(id); return el.value ? el.selectedOptions[0].textContent : ''; };
+  if ($('#fSearch').value.trim()) out.push(`“${$('#fSearch').value.trim()}”`);
+  if ($('#fAmount').value.trim()) out.push(`amount ${$('#fAmount').value.trim()}`);
+  if (sel('#fAccount')) out.push(sel('#fAccount'));
+  if (sel('#fCategory')) out.push(sel('#fCategory'));
+  if (sel('#fTag')) out.push(`tag ${sel('#fTag')}`);
+  if ($('#fUntagged').checked) out.push('untagged only');
+  return out;
+}
+function loadExport() {
+  const all = $('#exAllTime').checked;
+  $('#exportRange').textContent = all ? 'All dates' : currentRange().label;
+  const f = activeFilters();
+  $('#exFilterSummary').textContent = f.length ? `(${f.join(', ')})` : '(none set right now)';
+}
+$('#exAllTime').addEventListener('change', loadExport);
+$('#csvBtn').addEventListener('click', () => {
+  const allTime = $('#exAllTime').checked;
+  const q = $('#exUseFilters').checked ? txQuery({ allTime }) : (allTime ? '' : setRangeParams(new URLSearchParams()).toString());
+  location.href = `/api/export.csv?${q}`;
+});
 $('#sheetsBtn').addEventListener('click', (e) => busy(e.target, async () => {
-  const r = await api('/api/export/sheets', { method: 'POST', body: { month: $('#fAllTime').checked && state.view === 'transactions' ? null : state.month } });
+  const all = $('#exAllTime').checked;
+  const range = currentRange();
+  const body = all ? {} : range.month ? { month: range.month } : { from: range.from, to: range.to, label: range.label };
+  const r = await api('/api/export/sheets', { method: 'POST', body });
   toast(`Exported ${r.rows} rows to Google Sheets${r.url ? ` — <a href="${esc(r.url)}" target="_blank">open sheet</a>` : ''}`, false, true);
 }));
 
@@ -350,6 +679,76 @@ async function loadSettings() {
   const form = $('#settingsForm');
   for (const [k, v] of Object.entries(cfg)) if (form.elements[k]) form.elements[k].value = v;
 }
+
+// ---------- category manager ----------
+async function loadCategoryManager() {
+  const { categories, rules } = await api('/api/categories/manage');
+  $('#catManage tbody').innerHTML = categories.map((c) => `<tr data-name="${esc(c.name)}">
+      <td class="name">${esc(c.name)}${c.builtin ? ' <span class="hint">built in</span>' : ''}</td>
+      <td class="num">${c.count}</td>
+      <td class="num">${c.budget ? money(c.budget) : '<span class="hint">–</span>'}</td>
+      <td class="num">${c.builtin ? '' : '<button class="ghost small rename">Rename</button> <button class="ghost small del">Delete</button>'}</td>
+    </tr>`).join('');
+  $('#ruleList').innerHTML = rules.length
+    ? rules.map((r) => `<div class="rule" data-merchant="${esc(r.merchant)}"><span><strong>${esc(r.merchant)}</strong> → ${esc(r.category)}</span>
+        <button class="ghost small forget" title="Stop auto-categorizing this merchant">Forget</button></div>`).join('')
+    : '<div class="hint">None yet. When you change a transaction’s category, its merchant shows up here.</div>';
+}
+$('#addCategory').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  try {
+    const { name } = await api('/api/categories', { method: 'POST', body: { name: e.target.elements.name.value } });
+    e.target.reset();
+    toast(`Added “${name}”`);
+    await loadMeta();
+    loadCategoryManager();
+  } catch (err) { toast(err.message, true); }
+});
+$('#catManage').addEventListener('click', async (e) => {
+  const tr = e.target.closest('tr[data-name]');
+  if (!tr) return;
+  const name = tr.dataset.name;
+  if (e.target.classList.contains('del')) {
+    if (!confirm(`Delete “${name}”? Its transactions become Uncategorized and its budget is removed.`)) return;
+    try {
+      const r = await api(`/api/categories?name=${encodeURIComponent(name)}`, { method: 'DELETE' });
+      toast(`Deleted “${name}”${r.moved ? ` · ${r.moved} transaction${r.moved === 1 ? '' : 's'} now Uncategorized` : ''}`);
+    } catch (err) { return toast(err.message, true); }
+    await loadMeta();
+    loadCategoryManager();
+  }
+  if (e.target.classList.contains('rename')) {
+    const cell = $('.name', tr);
+    cell.innerHTML = `<input class="rename-input" value="${esc(name)}" maxlength="60">`;
+    const input = $('input', cell);
+    input.focus();
+    input.select();
+    let done = false;
+    const finish = async (save) => {
+      if (done) return;
+      done = true;
+      const to = input.value.trim();
+      if (save && to && to !== name) {
+        try {
+          const r = await api('/api/categories', { method: 'PATCH', body: { from: name, to } });
+          toast(r.name === to ? `Renamed to “${r.name}”` : `Merged into “${r.name}”`);
+          await loadMeta();
+        } catch (err) { toast(err.message, true); }
+      }
+      loadCategoryManager();
+    };
+    input.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') finish(true);
+      if (ev.key === 'Escape') finish(false);
+    });
+    input.addEventListener('blur', () => finish(true));
+  }
+});
+$('#ruleList').addEventListener('click', async (e) => {
+  if (!e.target.classList.contains('forget')) return;
+  await api(`/api/category-rules?merchant=${encodeURIComponent(e.target.closest('.rule').dataset.merchant)}`, { method: 'DELETE' });
+  loadCategoryManager();
+});
 $('#settingsForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   await api('/api/config', { method: 'PUT', body: Object.fromEntries(new FormData(e.target)) });
@@ -357,8 +756,40 @@ $('#settingsForm').addEventListener('submit', async (e) => {
 });
 
 // ---------- boot ----------
-$('#month').value = state.month;
+try {
+  const saved = JSON.parse(localStorage.getItem('bb.range') || 'null');
+  if (saved && ['month', 'year', 'ytd', 'custom'].includes(saved.mode)) Object.assign(state.range, saved);
+} catch {}
+if (state.range.mode === 'custom' && !(state.range.from && state.range.to)) state.range.mode = 'month';
+renderRangeControls();
 $('#month').addEventListener('change', (e) => e.target.value && setMonth(e.target.value));
+$('#rangeMode').addEventListener('change', (e) => setRangeMode(e.target.value));
+for (const id of ['#fromDate', '#toDate']) {
+  $(id).addEventListener('change', () => {
+    const from = $('#fromDate').value, to = $('#toDate').value;
+    if (!from || !to) return;
+    state.range.from = from;
+    state.range.to = to;
+    refreshRange();
+  });
+}
+// Toolbar Undo/Redo: same as Edit → Undo/Redo (Ctrl+Z / Ctrl+Y), acting on the text box you're typing in.
+const isTextField = (el) => el && (el.tagName === 'TEXTAREA' ||
+  (el.tagName === 'INPUT' && /^(text|search|number|email|url|tel|password|)$/.test(el.type)));
+function updateEditTools() {
+  const on = isTextField(document.activeElement);
+  $('#undoBtn').disabled = !on;
+  $('#redoBtn').disabled = !on;
+}
+['undo', 'redo'].forEach((cmd) => {
+  const btn = $(`#${cmd}Btn`);
+  btn.addEventListener('mousedown', (e) => e.preventDefault()); // keep focus (and the cursor) in the text box
+  btn.addEventListener('click', () => {
+    if (isTextField(document.activeElement)) document.execCommand(cmd);
+  });
+});
+document.addEventListener('focusin', updateEditTools);
+document.addEventListener('focusout', () => setTimeout(updateEditTools));
 $('#prevMonth').addEventListener('click', () => shiftMonth(-1));
 $('#nextMonth').addEventListener('click', () => shiftMonth(1));
 document.addEventListener('keydown', (e) => {
