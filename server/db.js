@@ -57,6 +57,7 @@ function open(dataDir) {
       note TEXT DEFAULT '',
       exclude INTEGER DEFAULT 0,
       category_manual INTEGER DEFAULT 0, -- 1 = you picked the category (sync and merchant rules leave it alone)
+      spread_months INTEGER DEFAULT 1,   -- >1 = count this amount evenly over that many months, starting with its own
       updated_at TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_tx_date ON transactions(date);
@@ -119,6 +120,7 @@ function migrate(db) {
   if (!cols('categories').includes('exclude')) db.exec('ALTER TABLE categories ADD COLUMN exclude INTEGER DEFAULT 0');
   // 0 = leave this account out of Projections (its balance, paychecks and spending).
   if (!cols('accounts').includes('in_projections')) db.exec('ALTER TABLE accounts ADD COLUMN in_projections INTEGER DEFAULT 1');
+  if (!cols('transactions').includes('spread_months')) db.exec('ALTER TABLE transactions ADD COLUMN spread_months INTEGER DEFAULT 1');
   if (!cols('income_streams').includes('estimate')) db.exec('ALTER TABLE income_streams ADD COLUMN estimate TEXT');
   if (cols('transactions').includes('teller_category')) {
     db.exec('ALTER TABLE transactions RENAME COLUMN teller_category TO bank_category');

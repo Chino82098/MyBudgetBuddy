@@ -88,6 +88,35 @@ function csvCell(v) {
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
+// ---------- spreading a payment over several months ----------
+// A transaction with spread_months = N > 1 (e.g. 6 months of car insurance paid up front) counts as N equal
+// monthly parts in totals, budgets, charts and Projections: one part in its own month, one in each month after,
+// on the same day of the month (or the month's last day). Cents left over from rounding go on the last part.
+// Used in place of "transactions t" anywhere amounts are added up. paid_date / paid_amount are the original.
+const SPREAD_MAX = 60;
+const TX_EFFECTIVE = `(
+  WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < ${SPREAD_MAX - 1})
+  SELECT id, account_id, category, tags, exclude, description, counterparty, date, amount,
+         date AS paid_date, amount AS paid_amount, 1 AS part, 1 AS spread_months
+  FROM transactions WHERE COALESCE(spread_months, 1) <= 1
+  UNION ALL
+  SELECT t.id, t.account_id, t.category, t.tags, t.exclude, t.description, t.counterparty,
+         date(t.date, 'start of month', '+' || n.i || ' months',
+              '+' || (MIN(CAST(strftime('%d', t.date) AS INTEGER),
+                          CAST(strftime('%d', t.date, 'start of month', '+' || (n.i + 1) || ' months', '-1 day') AS INTEGER)) - 1) || ' days'),
+         CASE WHEN n.i < t.spread_months - 1 THEN ROUND(t.amount / t.spread_months, 2)
+              ELSE ROUND(t.amount - ROUND(t.amount / t.spread_months, 2) * (t.spread_months - 1), 2) END,
+         t.date, t.amount, n.i + 1, t.spread_months
+  FROM transactions t JOIN n ON n.i < t.spread_months
+  WHERE t.spread_months > 1
+)`;
+
+// 1 (count once) .. SPREAD_MAX months; null if not a whole number in range.
+function spreadMonths(v) {
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 1 && n <= SPREAD_MAX ? n : null;
+}
+
 // ---------- queries ----------
 function parseAmount(input) {
   const raw = String(input ?? '').replace(/[$,\s]/g, '').replace(/^[-+]/, '');
@@ -141,7 +170,7 @@ function queryTransactions(db, q) {
     .prepare(
       `SELECT t.id, t.account_id, a.name AS account_name, a.institution, t.date, ${AMT} AS amount,
               t.description, t.counterparty, t.bank_category, t.type, t.status, t.category,
-              t.tags, t.note, t.exclude
+              t.tags, t.note, t.exclude, COALESCE(t.spread_months, 1) AS spread_months
        FROM transactions t JOIN accounts a ON a.id=t.account_id
        WHERE ${where.join(' AND ')}
        ORDER BY t.date DESC, t.id DESC
@@ -158,7 +187,8 @@ function summary(db, q) {
   const months = budgetMonths(dates);
   // Left out: hidden accounts (and, for Projections, accounts you left out there), rows with Skip ticked, Transfer and any category you've excluded.
   const skipCats = categories.excluded(db);
-  const base = `FROM transactions t JOIN accounts a ON a.id=t.account_id
+  // Spread payments count only the parts that fall in this range (see TX_EFFECTIVE).
+  const base = `FROM ${TX_EFFECTIVE} t JOIN accounts a ON a.id=t.account_id
     WHERE a.hidden=0${q.projection === true ? ' AND a.in_projections=1' : ''} AND t.exclude=0 AND t.category IS NOT NULL
       AND t.category NOT IN (${skipCats.map(() => '?').join(',')}) AND t.date BETWEEN ? AND ?`;
   const range = [...skipCats, ...dates]; // the base query's parameters, in order
@@ -197,6 +227,16 @@ function summary(db, q) {
   const daily = db
     .prepare(`SELECT ${bucket} AS date, SUM(-${AMT}) AS spent ${base} AND t.category<>'Income' GROUP BY 1 ORDER BY 1`)
     .all(...range);
+  // Spread payments with a part in this range, so the UI can explain why a total isn't the full amount paid.
+  const spread = db
+    .prepare(
+      `SELECT t.id, COALESCE(NULLIF(t.counterparty, ''), t.description) AS name, t.category, t.paid_date,
+              CASE WHEN a.invert_sign=1 THEN -t.paid_amount ELSE t.paid_amount END AS paid,
+              SUM(${AMT}) AS amount, MIN(t.part) AS first_part, MAX(t.part) AS last_part, t.spread_months
+       ${base} AND t.spread_months > 1 GROUP BY t.id ORDER BY t.paid_date, t.id`
+    )
+    .all(...range)
+    .map((r) => ({ ...r, amount: Math.round(r.amount * 100) / 100 }));
   return {
     month: q.month && monthRange(q.month) ? q.month : null,
     from: dates[0],
@@ -211,6 +251,7 @@ function summary(db, q) {
     byCategory,
     byTag: Object.values(byTag).sort((a, b) => b.spent - a.spent),
     daily,
+    spread,
   };
 }
 
@@ -318,9 +359,14 @@ function createApp(opts = {}) {
     if (b.tags !== undefined) sets.push('tags=?') && params.push(normTags(b.tags));
     if (b.note !== undefined) sets.push('note=?') && params.push(String(b.note));
     if (b.exclude !== undefined) sets.push('exclude=?') && params.push(b.exclude ? 1 : 0);
+    if (b.spread_months !== undefined) {
+      const n = spreadMonths(b.spread_months);
+      if (n === null) throw Object.assign(new Error(`Spread must be a whole number of months from 1 to ${SPREAD_MAX}`), { status: 400 });
+      sets.push('spread_months=?') && params.push(n);
+    }
     if (!sets.length) return { ok: true };
     db.prepare(`UPDATE transactions SET ${sets.join(', ')}, updated_at=datetime('now') WHERE id=?`).run(...params, m[1]);
-    const out = db.prepare('SELECT id, category, tags, note, exclude FROM transactions WHERE id=?').get(m[1]);
+    const out = db.prepare('SELECT id, category, tags, note, exclude, spread_months FROM transactions WHERE id=?').get(m[1]);
     if (cat !== undefined) {
       // Remember this merchant for future syncs, and tell the UI how many look-alikes could follow.
       out.merchant = categories.learn(db, row, cat);
@@ -432,11 +478,11 @@ function createApp(opts = {}) {
 
   route('GET', /^\/api\/export\.csv$/, (req, m, url) => {
     const rows = queryTransactions(db, Object.fromEntries(url.searchParams));
-    const head = ['Date', 'Description', 'Counterparty', 'Amount', 'Category', 'Tags', 'Note', 'Account', 'Status', 'Excluded'];
+    const head = ['Date', 'Description', 'Counterparty', 'Amount', 'Category', 'Tags', 'Note', 'Account', 'Status', 'Excluded', 'Spread (months)'];
     const lines = [head.join(',')].concat(
       rows.map((r) =>
         [r.date, r.description, r.counterparty, r.amount.toFixed(2), r.category, r.tags.replace(/,/g, ' '), r.note,
-          `${r.institution || ''} ${r.account_name || ''}`.trim(), r.status, r.exclude ? 'yes' : '']
+          `${r.institution || ''} ${r.account_name || ''}`.trim(), r.status, r.exclude ? 'yes' : '', r.spread_months > 1 ? r.spread_months : '']
           .map(csvCell).join(',')
       )
     );
@@ -461,7 +507,7 @@ function createApp(opts = {}) {
       transactions: tx.map((r) => ({
         date: r.date, description: r.description, counterparty: r.counterparty, amount: r.amount,
         category: r.category, tags: r.tags, note: r.note, account: `${r.institution || ''} ${r.account_name || ''}`.trim(),
-        status: r.status, excluded: !!r.exclude, id: r.id,
+        status: r.status, excluded: !!r.exclude, spread_months: r.spread_months, id: r.id,
       })),
       summary: s && { income: s.income, spending: s.spending, net: s.net, byCategory: s.byCategory, byTag: s.byTag },
     });
@@ -513,7 +559,7 @@ function start(port = Number(process.env.PORT) || 4757, opts) {
   });
 }
 
-module.exports = { start, createApp, __test: { summaryFor: summary } };
+module.exports = { start, createApp, __test: { summaryFor: summary, SPREAD_MAX } };
 
 if (require.main === module) {
   start()

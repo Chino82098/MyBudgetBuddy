@@ -601,3 +601,62 @@ test('API: projections and income streams', async (t) => {
   await call(`/api/accounts/${chk.id}`, { method: 'PATCH', body: JSON.stringify({ in_projections: true }) });
   assert.ok(Math.abs((await call(`/api/projections?today=${today}`)).body.cash.total - 3245.18) < 0.01, 'back in');
 });
+
+test('spread a payment over several months', async (t) => {
+  const { server, port, app } = await start(0, { plaidClient: fakePlaid([]) });
+  t.after(() => server.close());
+  const call = async (p, opts = {}) => {
+    const res = await fetch(`http://127.0.0.1:${port}${p}`, { ...opts, headers: { 'Content-Type': 'application/json', 'X-Budget-Buddy': '1' } });
+    return { status: res.status, body: res.headers.get('content-type').includes('json') ? await res.json() : await res.text() };
+  };
+  const db = app.db;
+  db.exec(`INSERT INTO enrollments (id, provider, access_token) VALUES ('spread_e', 'demo', 'x');
+    INSERT INTO accounts (id, enrollment_id, name) VALUES ('spread_a', 'spread_e', 'Spread Checking');`);
+  const ins = db.prepare('INSERT INTO transactions (id, account_id, date, amount, description, category) VALUES (?, ?, ?, ?, ?, ?)');
+  ins.run('sp_pet', 'spread_a', '2031-01-31', -600, 'PET INSURANCE', 'Pets');
+  ins.run('sp_car', 'spread_a', '2031-11-05', -700.01, 'CAR INSURANCE', 'Insurance');
+  const cat = (s, c) => (s.byCategory.find((x) => x.category === c) || { spent: 0 }).spent;
+
+  assert.equal(cat((await call('/api/summary?month=2031-01')).body, 'Pets'), 600, 'counted once by default');
+
+  let r = await call('/api/transactions/sp_pet', { method: 'PATCH', body: JSON.stringify({ spread_months: 12 }) });
+  assert.equal(r.body.spread_months, 12);
+  await call('/api/transactions/sp_car', { method: 'PATCH', body: JSON.stringify({ spread_months: 6 }) });
+  for (const bad of [0, 61, 2.5, 'x']) {
+    assert.equal((await call('/api/transactions/sp_pet', { method: 'PATCH', body: JSON.stringify({ spread_months: bad }) })).status, 400);
+  }
+
+  const jan = (await call('/api/summary?month=2031-01')).body;
+  assert.equal(cat(jan, 'Pets'), 50);
+  const feb = (await call('/api/summary?month=2031-02')).body;
+  assert.equal(cat(feb, 'Pets'), 50, 'Jan 31 lands on Feb 28');
+  const p = feb.spread.find((x) => x.id === 'sp_pet');
+  assert.deepEqual([p.amount, p.paid, p.first_part, p.last_part, p.spread_months, p.paid_date], [-50, -600, 2, 2, 12, '2031-01-31']);
+  assert.equal(cat((await call('/api/summary?from=2031-01-01&to=2031-12-31')).body, 'Pets'), 600, 'whole year adds up');
+  assert.equal(cat((await call('/api/summary?month=2032-01')).body, 'Pets'), 0, 'nothing after month 12');
+
+  // 700.01 / 6: five parts of 116.67 and a last of 116.66; the parts add up to the exact amount.
+  assert.equal(cat((await call('/api/summary?month=2031-12')).body, 'Insurance'), 116.67);
+  assert.equal(cat((await call('/api/summary?month=2032-04')).body, 'Insurance'), 116.66);
+  assert.equal(cat((await call('/api/summary?from=2031-11-01&to=2032-06-30')).body, 'Insurance'), 700.01);
+
+  // The transaction list and exports still show the payment once, at its full amount.
+  const list = (await call('/api/transactions?account=spread_a')).body;
+  assert.deepEqual(list.map((x) => [x.id, x.amount, x.spread_months]), [['sp_car', -700.01, 6], ['sp_pet', -600, 12]]);
+  const csv = (await call('/api/export.csv?account=spread_a')).body;
+  assert.match(csv, /Spread \(months\)/);
+  assert.match(csv, /PET INSURANCE.*,12$/m);
+
+  // Back to counting once.
+  await call('/api/transactions/sp_pet', { method: 'PATCH', body: JSON.stringify({ spread_months: 1 }) });
+  assert.equal(cat((await call('/api/summary?month=2031-01')).body, 'Pets'), 600);
+  db.exec("DELETE FROM enrollments WHERE id='spread_e'");
+});
+
+test('sync keeps a spread when a pending charge posts', async () => {
+  const db = plaidDb();
+  await syncAll(db, fakePlaid([{ added: [ptx('pend1', '2026-10-01', 600, { pending: true })], modified: [], removed: [], next_cursor: 'c1', has_more: false }]));
+  db.prepare("UPDATE transactions SET spread_months=12 WHERE id='pend1'").run();
+  await syncAll(db, fakePlaid([{ added: [ptx('post1', '2026-10-02', 600, { pending_transaction_id: 'pend1' })], modified: [], removed: [{ transaction_id: 'pend1' }], next_cursor: 'c2', has_more: false }]));
+  assert.equal(db.prepare("SELECT spread_months FROM transactions WHERE id='post1'").get().spread_months, 12);
+});

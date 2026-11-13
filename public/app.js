@@ -152,11 +152,19 @@ function catOptions(current) {
 
 // Swaps a category <select> for a text box to type a new category. Resolves with the name, or null if cancelled.
 function askNewCategory(select, restoreTo) {
+  return askInline(select, restoreTo, { placeholder: 'New category, then Enter', maxLength: 60 });
+}
+
+// Swaps a <select> for a text box until Enter, Escape or blur. Resolves with the trimmed text, or null.
+function askInline(select, restoreTo, { placeholder, maxLength = 60, type = 'text', min, max } = {}) {
   return new Promise((resolve) => {
     const input = document.createElement('input');
     input.className = 'new-cat';
-    input.placeholder = 'New category, then Enter';
-    input.maxLength = 60;
+    input.placeholder = placeholder;
+    input.type = type;
+    if (type === 'text') input.maxLength = maxLength;
+    if (min !== undefined) input.min = min;
+    if (max !== undefined) input.max = max;
     select.replaceWith(input);
     input.focus();
     let done = false;
@@ -199,6 +207,11 @@ async function loadDashboard() {
   const skipped = (s.excludedCategories || []);
   $('#excludedNote').innerHTML = skipped.length
     ? `Not counted: ${skipped.map(esc).join(', ')} · <a href="#categories">change</a>` : '';
+  const spread = s.spread || [];
+  $('#spreadNote').innerHTML = spread.length
+    ? `Spread payments counted here: ${spread.map((p) => `${esc(p.name)} ${money(-p.amount)} of ${money(-p.paid)} ` +
+        `(${p.first_part === p.last_part ? `month ${p.first_part}` : `months ${p.first_part}–${p.last_part}`} of ${p.spread_months}, paid ${niceDate(p.paid_date)})`).join(' · ')}`
+    : '';
   $('#budgetHint').textContent = s.months === 1 ? 'click a budget to edit it'
     : `budgets × ${s.months} months · click one to edit the monthly amount`;
 
@@ -538,6 +551,34 @@ async function loadTransactions({ keepSelection = false } = {}) {
 
 const catExcluded = (c) => (state.meta.excluded || []).includes(c);
 
+// ---------- spreading a payment over several months ----------
+const SPREAD_CHOICES = [1, 2, 3, 4, 6, 12, 18, 24];
+const SPREAD_MAX = 60;
+const OTHER_SPREAD = '__other__';
+const monthLabel = (ym) => `${MONTHS[Number(ym.slice(5, 7)) - 1]} ${ym.slice(0, 4)}`;
+const addMonthsYM = (ym, n) => { const [y, m] = ym.split('-').map(Number); const d = new Date(Date.UTC(y, m - 1 + n, 1)); return d.toISOString().slice(0, 7); };
+
+function spreadOptions(n) {
+  const list = SPREAD_CHOICES.includes(n) ? SPREAD_CHOICES : [...SPREAD_CHOICES, n].sort((a, b) => a - b);
+  return list.map((k) => `<option value="${k}"${k === n ? ' selected' : ''}>${k === 1 ? 'Count once' : `Spread ${k} mo`}</option>`).join('') +
+    `<option value="${OTHER_SPREAD}">Other…</option>`;
+}
+
+// What a spread payment counts as each month, e.g. "$50.00/mo · Jan 2026 – Dec 2026".
+function spreadDetail(t) {
+  const n = t.spread_months || 1;
+  if (n <= 1) return '';
+  const start = t.date.slice(0, 7);
+  return `${money(Math.abs(Math.round((t.amount / n) * 100) / 100))}/mo · ${monthLabel(start)} – ${monthLabel(addMonthsYM(start, n - 1))}`;
+}
+
+function amountCell(t) {
+  const n = t.spread_months || 1;
+  return `<div class="${t.amount < 0 ? '' : 'pos'}">${money(t.amount)}</div>
+    <select data-f="spread_months" class="spread${n > 1 ? ' on' : ''}" title="Count this amount in one month, or split it evenly over several (e.g. a year of insurance paid up front)">${spreadOptions(n)}</select>
+    ${n > 1 ? `<div class="spread-each">${esc(spreadDetail(t))}</div>` : ''}`;
+}
+
 function renderTx() {
   const tbody = $('#txTable tbody');
   tbody.innerHTML = state.tx.map((t) => `
@@ -549,7 +590,7 @@ function renderTx() {
       <td class="cat"><select data-f="category" title="Category">${catOptions(t.category)}</select></td>
       <td class="tags"><input data-f="tags" value="${esc(t.tags.split(',').filter(Boolean).join(', '))}" placeholder="add tags"></td>
       <td class="note"><input data-f="note" value="${esc(t.note)}" placeholder="add a note"></td>
-      <td class="num ${t.amount < 0 ? '' : 'pos'}">${money(t.amount)}</td>
+      <td class="num amt">${amountCell(t)}</td>
       <td><input type="checkbox" data-f="exclude" ${t.exclude ? 'checked' : ''} title="Exclude from budget totals"></td>
     </tr>`).join('');
   const empty = $('#txEmpty');
@@ -568,7 +609,16 @@ async function saveField(input) {
     value = await askNewCategory(input, tx.category);
     if (!value) return;
   }
-  const prev = field === 'exclude' ? !!tx.exclude : field === 'tags' ? tx.tags.split(',').filter(Boolean).join(', ') : tx[field];
+  if (field === 'spread_months') {
+    if (value === OTHER_SPREAD) {
+      value = await askInline(input, String(tx.spread_months || 1), { placeholder: `Months (1–${SPREAD_MAX}), then Enter`, type: 'number', min: 1, max: SPREAD_MAX });
+      if (!value) return;
+    }
+    value = Number(value);
+    if (!Number.isInteger(value) || value < 1 || value > SPREAD_MAX) return toast(`Enter a whole number of months from 1 to ${SPREAD_MAX}`, true);
+  }
+  const prev = field === 'exclude' ? !!tx.exclude : field === 'tags' ? tx.tags.split(',').filter(Boolean).join(', ')
+    : field === 'spread_months' ? tx.spread_months || 1 : tx[field];
   if (prev === value) return;
   try {
     const out = await api(`/api/transactions/${encodeURIComponent(id)}`, { method: 'PATCH', body: { [field]: value } });
@@ -579,6 +629,15 @@ async function saveField(input) {
     void input.offsetWidth;
     input.closest('td').classList.add('saved');
     if (field === 'tags') loadMeta();
+    if (field === 'spread_months') {
+      const td = tr.querySelector('td.amt');
+      td.innerHTML = amountCell(tx);
+      td.classList.remove('saved');
+      void td.offsetWidth;
+      td.classList.add('saved');
+      toast(tx.spread_months > 1 ? `Counting ${spreadDetail(tx)}` : 'Counted once, in the month it was paid');
+      return;
+    }
     if (field === 'category') {
       const isNew = !state.meta.categories.includes(out.category);
       await loadMeta();
