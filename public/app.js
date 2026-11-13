@@ -44,9 +44,12 @@ async function busy(btn, fn) {
 // ---------- navigation ----------
 function show(view) {
   state.view = view;
+  if (view !== 'projections' && $('#projSettings').open) $('#projSettings').close();
   $$('.view').forEach((v) => v.classList.toggle('active', v.id === `view-${view}`));
   $$('nav a').forEach((a) => a.classList.toggle('active', a.dataset.view === view));
-  const loaders = { dashboard: loadDashboard, transactions: loadTransactions, categories: loadCategoryManager,
+  // Projections always show the current month/year, so the date picker is hidden there.
+  $('.month-picker').classList.toggle('hidden', view === 'projections');
+  const loaders = { dashboard: loadDashboard, projections: loadProjections, transactions: loadTransactions, categories: loadCategoryManager,
     accounts: loadAccounts, export: loadExport, settings: loadSettings };
   (loaders[view] || loadDashboard)();
 }
@@ -149,11 +152,19 @@ function catOptions(current) {
 
 // Swaps a category <select> for a text box to type a new category. Resolves with the name, or null if cancelled.
 function askNewCategory(select, restoreTo) {
+  return askInline(select, restoreTo, { placeholder: 'New category, then Enter', maxLength: 60 });
+}
+
+// Swaps a <select> for a text box until Enter, Escape or blur. Resolves with the trimmed text, or null.
+function askInline(select, restoreTo, { placeholder, maxLength = 60, type = 'text', min, max } = {}) {
   return new Promise((resolve) => {
     const input = document.createElement('input');
     input.className = 'new-cat';
-    input.placeholder = 'New category, then Enter';
-    input.maxLength = 60;
+    input.placeholder = placeholder;
+    input.type = type;
+    if (type === 'text') input.maxLength = maxLength;
+    if (min !== undefined) input.min = min;
+    if (max !== undefined) input.max = max;
     select.replaceWith(input);
     input.focus();
     let done = false;
@@ -185,7 +196,7 @@ async function loadDashboard() {
     ? s.byCategory.map((c) => {
         const pct = c.budget ? c.spent / c.budget : 0;
         const cls = c.budget ? (pct > 1 ? 'over' : pct > 0.85 ? 'near' : '') : '';
-        const width = ((c.budget ? Math.min(c.spent, c.budget) / c.budget : c.spent / max) * 100).toFixed(1);
+        const width = (Math.max(0, c.budget ? Math.min(c.spent, c.budget) / c.budget : c.spent / max) * 100).toFixed(1);
         return `<div class="cat-row" data-cat="${esc(c.category)}">
           <div class="cat-name">${esc(c.category)}</div>
           <div class="bar ${cls}"><span style="width:${width}%"></span></div>
@@ -193,6 +204,14 @@ async function loadDashboard() {
         </div>`;
       }).join('')
     : '<div class="empty">No spending in this period yet. Connect a bank or load demo data from Accounts.</div>';
+  const skipped = (s.excludedCategories || []);
+  $('#excludedNote').innerHTML = skipped.length
+    ? `Not counted: ${skipped.map(esc).join(', ')} · <a href="#categories">change</a>` : '';
+  const spread = s.spread || [];
+  $('#spreadNote').innerHTML = spread.length
+    ? `Spread payments counted here: ${spread.map((p) => `${esc(p.name)} ${money(-p.amount)} of ${money(-p.paid)} ` +
+        `(${p.first_part === p.last_part ? `month ${p.first_part}` : `months ${p.first_part}–${p.last_part}`} of ${p.spread_months}, paid ${niceDate(p.paid_date)})`).join(' · ')}`
+    : '';
   $('#budgetHint').textContent = s.months === 1 ? 'click a budget to edit it'
     : `budgets × ${s.months} months · click one to edit the monthly amount`;
 
@@ -229,7 +248,7 @@ function drawDaily(s) {
   let bars = '';
   keys.forEach((k, i) => {
     const v = map[k] || 0;
-    const h = (v / max) * (H - pad - 6);
+    const h = (Math.max(0, v) / max) * (H - pad - 6);
     bars += `<rect x="${5 + i * bw + 1}" y="${H - pad - h}" width="${Math.max(1, bw - 2)}" height="${h}" rx="2"><title>${tip(k)}: ${money(v)}</title></rect>`;
     const show = oneMonth ? (i === 0 || (i + 1) % 5 === 0) : i % every === 0;
     if (show) bars += `<text x="${5 + i * bw + bw / 2}" y="${H - 4}" text-anchor="middle">${label(k, i)}</text>`;
@@ -264,6 +283,250 @@ $('#addBudget').addEventListener('submit', async (e) => {
   loadDashboard();
 });
 
+// ---------- projections ----------
+// Always the current month (or year): income so far + paychecks still to come, minus spending.
+const FREQ_LABELS = { weekly: 'Weekly', biweekly: 'Every 2 weeks', semimonthly: 'Twice a month', monthly: 'Monthly' };
+// How to estimate a paycheck that changes size (hours, overtime, holiday pay). Same keys as the server.
+const ESTIMATE_LABELS = {
+  average: '6-month average', recent: 'Average of last 4', median: 'Typical (middle)', low: 'Conservative', last: 'Last paycheck',
+};
+const ESTIMATE_HELP = {
+  average: 'Average of every paycheck in the last 6 months. Busy weeks, slow weeks and holiday pay even out.',
+  recent: 'Average of the last 4 paychecks. Follows a recent raise or change in hours.',
+  median: 'The middle paycheck of the last 6 months. One unusually big or small check doesn’t move it.',
+  low: 'A slower-than-usual paycheck: 3 in 4 of your paychecks were at least this much. Safer for tight budgets.',
+  last: 'Exactly what your most recent paycheck was.',
+};
+const moneyRange = (r) => `${money(r.low)}–${money(r.high)}`;
+state.projPeriod = 'month';
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+const line = (label, value, hint = '', cls = '') =>
+  `<div class="line ${cls}"><span>${label}${hint ? `<span class="hint">${hint}</span>` : ''}</span><span>${value}</span></div>`;
+const signed = (n, sign) => `${sign}${money(Math.abs(n))}`;
+
+async function loadProjections() {
+  const p = await api(`/api/projections?period=${state.projPeriod}&today=${localISO()}`);
+  state.proj = p;
+  const yr = p.period === 'year';
+  const endWord = yr ? 'year' : 'month';
+  $('#view-projections').classList.toggle('year', yr);
+  $$('#view-projections .seg button').forEach((b) => b.classList.toggle('active', b.dataset.period === p.period));
+  const name = yr ? p.from.slice(0, 4) : new Date(p.from + 'T00:00:00Z').toLocaleString(undefined, { month: 'long', year: 'numeric', timeZone: 'UTC' });
+  $('#projAsOf').textContent = `${name} · as of ${niceDate(p.today)} · ${plural(p.daysLeft, 'day')} left`;
+
+  const inc = p.income;
+  const nPay = inc.streams.filter((s) => s.enabled).reduce((a, s) => a + s.expectedDates.length, 0);
+  $('#pIncome').textContent = money(inc.projected);
+  $('#pIncomeSub').textContent = `${money(inc.soFar)} so far + ${money(inc.expected)} expected` +
+    (inc.range ? ` · likely ${money(inc.range.projectedLow)}–${money(inc.range.projectedHigh)}` : '');
+  $('#pSpent').textContent = money(p.spending.soFar);
+  $('#pSpentSub').textContent = `about ${money(p.spending.remaining)} more planned`;
+  $('#pLeft').textContent = money(p.leftToSpend);
+  $('#pLeft').className = 'value ' + (p.leftToSpend >= 0 ? 'pos' : 'neg');
+  $('#pLeftSub').textContent = p.leftToSpend >= 0 ? `≈ ${money(p.perDay)} a day for ${plural(p.daysLeft, 'day')}` : 'Spending is ahead of income';
+  $('#pBalLabel').textContent = `Bank balance at ${endWord} end`;
+  const weekLabel = `End of this week (${niceDate(p.weekEnd, false)})`;
+  if (p.balance) {
+    $('#pBal').textContent = money(p.balance.end);
+    $('#pBal').className = 'value ' + (p.balance.end < 0 ? 'neg' : '');
+    $('#pBalSub').textContent = (p.balance.endRange ? `Likely ${moneyRange(p.balance.endRange)} · ` : '') + `${weekLabel}: ${money(p.balance.week)}`;
+  } else {
+    $('#pBal').textContent = '–';
+    $('#pBal').className = 'value';
+    $('#pBalSub').textContent = 'Connect a checking or savings account to see this';
+  }
+
+  const payDays = inc.streams.filter((s) => s.enabled).flatMap((s) => s.expectedDates).sort();
+  const dayList = payDays.length > 4 ? `${niceDate(payDays[0], false)} … ${niceDate(payDays.at(-1), false)}` : payDays.map((d) => niceDate(d, false)).join(', ');
+  // Paychecks that vary: show where the total would land if they came in low or high.
+  const varyHint = inc.range ? `paychecks vary: likely ${moneyRange(inc.range)}` : '';
+  const payHint = [dayList, varyHint].filter(Boolean).join(' · ');
+  $('#pMath').innerHTML =
+    line('Income so far', signed(inc.soFar, '+')) +
+    line(`Paychecks still to come (${nPay})`, signed(inc.expected, '+'), payHint) +
+    line('Spent so far', signed(p.spending.soFar, '−')) +
+    line('Left to spend', money(p.leftToSpend), p.leftRange ? `likely ${moneyRange(p.leftRange)}` : '', `total ${p.leftToSpend < 0 ? 'neg' : 'pos'}`) +
+    line('Left after planned spending', money(p.afterPlanned), 'room for anything unplanned, or to save', `total sub-total ${p.afterPlanned < 0 ? 'neg' : ''}`);
+  const accts = p.cash.accounts.map((a) => `${a.name}${a.last_four ? ` ····${a.last_four}` : ''}${a.balance == null ? ' (no balance)' : ''}`).join(', ');
+  $('#pBalMath').innerHTML = p.balance
+    ? line('Checking &amp; savings today', money(p.cash.total), esc(accts)) +
+      line('Paychecks still to come', signed(inc.expected, '+'), varyHint) +
+      line('Planned spending still to come', signed(p.spending.remaining, '−')) +
+      line(`Projected at ${endWord} end (${niceDate(p.to, false)})`, money(p.balance.end),
+        p.balance.endRange ? `likely ${moneyRange(p.balance.endRange)}` : '', `total ${p.balance.end < 0 ? 'neg' : ''}`) +
+      line(weekLabel, money(p.balance.week), `${signed(inc.expectedWeek, '+')} paychecks, ${signed(p.spending.remainingWeek, '−')} spending`, 'total sub-total') +
+      '<p class="hint">Card purchases count when you make them, as if you pay the card from checking. Card payments are Transfers, so they aren’t counted twice.</p>'
+    : '<div class="hint">No checking or savings balance yet. Connect a bank under Accounts and Sync.</div>';
+
+  renderProjAccounts(p);
+  renderStreams(p);
+  renderProjBudgets(p);
+}
+
+// Tick which accounts count toward the projection (balances, paychecks and spending).
+const ACCT_TYPES = { depository: 'Checking & savings', credit: 'Card', loan: 'Loan', investment: 'Investment' };
+function renderProjAccounts(p) {
+  const list = p.accounts || [];
+  const on = list.filter((a) => a.included).length;
+  $('#projAcctCount').textContent = list.length ? `${on} of ${list.length} counted` : '';
+  $('#projAccounts').innerHTML = list.length ? list.map((a) => `<label class="check acct-chip${a.included ? '' : ' off'}" title="${esc(a.institution || '')}">
+      <input type="checkbox" class="pa-on" data-id="${esc(a.id)}" ${a.included ? 'checked' : ''}>
+      ${esc(a.name)}${a.last_four ? ` ····${esc(a.last_four)}` : ''}<span class="hint">${esc(ACCT_TYPES[a.type] || a.type || '')}</span>
+    </label>`).join('')
+    : '<div class="hint">No accounts yet. Connect a bank under Accounts and Sync.</div>';
+}
+$('#projAccounts').addEventListener('change', async (e) => {
+  if (!e.target.classList.contains('pa-on')) return;
+  try {
+    await api(`/api/accounts/${encodeURIComponent(e.target.dataset.id)}`, { method: 'PATCH', body: { in_projections: e.target.checked } });
+    await loadProjections();
+  } catch (err) { toast(err.message, true); }
+});
+
+function renderStreams(p) {
+  const yr = p.period === 'year';
+  $('#streamPeriodHead').textContent = `Still to come this ${yr ? 'year' : 'month'}`;
+  const freqOpts = (cur) => Object.entries(FREQ_LABELS).map(([k, v]) => `<option value="${k}"${k === cur ? ' selected' : ''}>${v}</option>`).join('');
+  $('#streamTable tbody').innerHTML = p.income.streams.map((s) => {
+    const d = s.detected;
+    const info = s.manual ? 'Added by you'
+      : s.stale ? `Not seen since ${niceDate(d.lastDate)}, so it’s not counted. Tick Use if it’s still coming.`
+      : d.variable ? `Varies: usually ${money(d.low)}–${money(d.high)} (${money(d.min)}–${money(d.max)} over ${plural(d.deposits, 'paycheck')}) · last paid ${niceDate(d.lastDate, false)}`
+      : `Found ${plural(d.deposits, 'deposit')} · last paid ${niceDate(d.lastDate, false)}${d.averagedOver > 1 ? ` · average of last ${d.averagedOver}` : ''}`;
+    // Hover the source to see the paychecks the estimate is based on.
+    const histTitle = d && d.history ? 'Recent paychecks:\n' + d.history.slice().reverse().map((h) => `${niceDate(h.date, false)}  ${money(h.amount)}`).join('\n') : '';
+    // Paychecks that vary (or where you picked a method) get a choice of how to estimate them.
+    const showEst = d && (d.variable || s.changed.estimate);
+    const estSel = showEst ? `<select class="s-est${s.changed.estimate ? ' changed' : ''}" title="${esc(ESTIMATE_HELP[s.estimate] || 'You typed this amount. Pick a method to go back to an estimate.')}">
+        ${s.estimate === 'custom' ? '<option value="" selected>Your amount</option>' : ''}
+        ${Object.entries(ESTIMATE_LABELS).map(([k, v]) => `<option value="${k}"${k === s.estimate ? ' selected' : ''}>${v} · ${money(d.estimates[k])}</option>`).join('')}
+      </select>` : '';
+    // Highlights a value you changed; hovering shows what was detected.
+    const was = (cls, field, label) => (d && s.changed[field] ? ` class="${cls} changed" title="Detected: ${esc(label)}"` : ` class="${cls}"`);
+    const anyChange = Object.values(s.changed).some(Boolean);
+    return `<tr data-key="${esc(s.key)}" class="${s.enabled ? '' : 'off'}">
+      <td class="center"><input type="checkbox" class="s-on" ${s.enabled ? 'checked' : ''} title="Count this paycheck"></td>
+      <td><input${was('stream-name', 'name', d && d.name)} value="${esc(s.name)}" maxlength="60"><div class="hint"${histTitle ? ` title="${esc(histTitle)}"` : ''}>${esc(info)}</div></td>
+      <td><select${was('s-freq', 'frequency', d && FREQ_LABELS[d.frequency])}>${freqOpts(s.frequency)}</select></td>
+      <td class="num"><input type="number"${was('s-amt', 'amount', d && money(d.amount))} min="0" step="0.01" value="${s.amount}">${estSel ? `<div>${estSel}</div>` : ''}</td>
+      <td><input type="date" class="s-next${s.changed.nextDate && d ? ' changed' : ''}" value="${s.nextDate || ''}"${s.changed.nextDate && d ? ' title="You set this date"' : ''}></td>
+      <td class="num">${money(s.enabled ? s.expectedTotal : 0)}<div class="hint">${plural(s.expectedDates.length, 'paycheck')}${s.enabled && s.range && s.expectedDates.length ? ` · ${money(s.expectedLow)}–${money(s.expectedHigh)}` : ''}</div></td>
+      <td class="num">${s.manual ? '<button class="ghost small s-del">Delete</button>' : anyChange ? '<button class="ghost small s-reset" title="Go back to what was detected">Reset</button>' : ''}</td>
+    </tr>`;
+  }).join('');
+  const empty = !p.income.streams.length;
+  $('#streamTable').classList.toggle('hidden', empty);
+  $('#streamEmpty').classList.toggle('hidden', !empty);
+  $('#streamEmpty').textContent = 'No paychecks found yet. Categorize at least two paycheck deposits as Income, or add one yourself.';
+}
+
+function renderProjBudgets(p) {
+  const yr = p.period === 'year';
+  $('#pbSpentHead').textContent = yr ? 'Spent this year' : 'Spent so far';
+  $('#pbProjHead').textContent = yr ? 'Projected for year' : 'Projected for month';
+  $('#projBudgets tbody').innerHTML = p.byCategory.length ? p.byCategory.map((c) => {
+    const has = c.budget != null;
+    const scale = Math.max(1, c.budget || 0, c.projected, c.spent);
+    const w = (n) => (Math.max(0, n) / scale * 100).toFixed(1);
+    const cls = { over: 'over', near: 'near' }[c.status] || '';
+    const note = c.status === 'over' ? `<div class="over-note">Over budget by ${money(c.spent - c.budget)}</div>` : '';
+    return `<tr data-cat="${esc(c.category)}" class="${has ? '' : 'no-budget'}">
+      <td>${esc(c.category)}${note}</td>
+      <td class="num">${money(c.spent)}</td>
+      <td class="num"><input type="number" class="pb-input" min="0" step="1" value="${c.budgetMonthly ?? ''}" placeholder="${c.typical ? `~${Math.round(c.typical)}` : 'none'}" title="Monthly budget for ${esc(c.category)}${c.typical ? ` (you usually spend about ${money(c.typical)} a month)` : ''}"></td>
+      <td class="num yr">${has ? money(c.budget) : '–'}</td>
+      <td class="bar-col"><div class="bar ${cls}"><span style="width:${w(c.spent)}%"></span><span class="plan" style="left:${w(c.spent)}%;width:${w(c.remaining)}%" title="${money(c.remaining)} still planned"></span></div></td>
+      <td class="num">${money(c.projected)}</td>
+      <td class="num left ${has && c.budget - c.spent < 0 ? 'neg' : ''}">${has ? money(c.budget - c.spent) : '–'}</td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="7" class="hint">No spending yet. Connect a bank or load demo data from Accounts.</td></tr>';
+  const shown = new Set(p.byCategory.map((c) => c.category));
+  const skip = new Set([...(p.excludedCategories || []), 'Income', 'Transfer']);
+  $('#projAddBudget select').innerHTML = '<option value="">Add a budget for…</option>' +
+    state.meta.categories.filter((c) => !shown.has(c) && !skip.has(c)).map((c) => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
+  $('#projBudgetHint').textContent = yr ? 'monthly amounts (× 12 for the year); type one in to set it, clear it to remove'
+    : 'monthly amounts; type one in to set it, clear it to remove';
+  const h = p.history;
+  const usual = h.months ? `your usual monthly spending (average of the last ${plural(h.months, 'full month')})` : 'this month’s pace so far (there’s no full month of history yet)';
+  $('#projNote').innerHTML = `Projected = spent so far + what’s still planned: your budget, or ${usual} where there’s no budget.` +
+    (p.excludedCategories.length ? ` Not counted: ${p.excludedCategories.map(esc).join(', ')} · <a href="#categories">change</a>` : '');
+}
+
+// Projection settings drawer (Accounts counted + Paychecks)
+const projSettings = $('#projSettings');
+$('#projSettingsBtn').addEventListener('click', () => projSettings.showModal());
+$('#projSettingsClose').addEventListener('click', () => projSettings.close());
+projSettings.addEventListener('click', (e) => { // clicking the dimmed backdrop (outside the panel) closes it
+  const r = projSettings.getBoundingClientRect();
+  if (e.target === projSettings && (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom)) projSettings.close();
+});
+$$('#view-projections .seg button').forEach((b) => b.addEventListener('click', () => {
+  state.projPeriod = b.dataset.period;
+  loadProjections().catch((e) => toast(e.message, true));
+}));
+
+async function saveStreamField(key, body) {
+  try {
+    await api('/api/income-streams', { method: 'PUT', body: { key, ...body } });
+    await loadProjections();
+  } catch (e) { toast(e.message, true); }
+}
+$('#streamTable').addEventListener('change', (e) => {
+  const tr = e.target.closest('tr[data-key]');
+  if (!tr) return;
+  const key = tr.dataset.key;
+  const el = e.target;
+  if (el.classList.contains('s-on')) saveStreamField(key, { enabled: el.checked });
+  if (el.classList.contains('s-freq')) saveStreamField(key, { frequency: el.value });
+  if (el.classList.contains('s-amt')) saveStreamField(key, { amount: el.value === '' ? null : Number(el.value) });
+  // Picking a method replaces an amount you typed in.
+  if (el.classList.contains('s-est') && el.value) saveStreamField(key, { estimate: el.value, amount: null });
+  if (el.classList.contains('s-next')) saveStreamField(key, { next_date: el.value || null });
+  if (el.classList.contains('stream-name')) saveStreamField(key, { name: el.value.trim() || null });
+});
+$('#streamTable').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && e.target.matches('input')) { e.preventDefault(); e.target.blur(); }
+});
+$('#streamTable').addEventListener('click', async (e) => {
+  const tr = e.target.closest('tr[data-key]');
+  if (!tr) return;
+  const isDel = e.target.classList.contains('s-del');
+  if (!isDel && !e.target.classList.contains('s-reset')) return;
+  if (isDel && !confirm('Delete this income?')) return;
+  try {
+    await api(`/api/income-streams?key=${encodeURIComponent(tr.dataset.key)}`, { method: 'DELETE' });
+    toast(isDel ? 'Income deleted' : 'Back to the detected paycheck');
+    await loadProjections();
+  } catch (err) { toast(err.message, true); }
+});
+$('#addStream').addEventListener('click', (e) => busy(e.target, async () => {
+  const { key } = await api('/api/income-streams', { method: 'POST', body: { name: 'Paycheck', amount: 0, frequency: 'biweekly', next_date: localISO() } });
+  await loadProjections();
+  const row = $$('#streamTable tr[data-key]').find((r) => r.dataset.key === key);
+  if (row) { $('.s-amt', row).focus(); $('.s-amt', row).select(); }
+}));
+
+async function setBudget(category, value) {
+  await api('/api/budgets', { method: 'PUT', body: { category, monthly_limit: Number(value) || 0 } });
+  await loadMeta();
+  await loadProjections();
+}
+$('#projBudgets').addEventListener('change', (e) => {
+  if (!e.target.classList.contains('pb-input')) return;
+  setBudget(e.target.closest('tr[data-cat]').dataset.cat, e.target.value).catch((err) => toast(err.message, true));
+});
+$('#projBudgets').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && e.target.classList.contains('pb-input')) { e.preventDefault(); e.target.blur(); }
+});
+$('#projAddBudget').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  try {
+    await setBudget(f.get('category'), f.get('limit'));
+    e.target.reset();
+  } catch (err) { toast(err.message, true); }
+});
+
 // ---------- transactions ----------
 function txQuery({ allTime = $('#fAllTime').checked } = {}) {
   const p = new URLSearchParams();
@@ -286,10 +549,40 @@ async function loadTransactions({ keepSelection = false } = {}) {
   renderTx();
 }
 
+const catExcluded = (c) => (state.meta.excluded || []).includes(c);
+
+// ---------- spreading a payment over several months ----------
+const SPREAD_CHOICES = [1, 2, 3, 4, 6, 12, 18, 24];
+const SPREAD_MAX = 60;
+const OTHER_SPREAD = '__other__';
+const monthLabel = (ym) => `${MONTHS[Number(ym.slice(5, 7)) - 1]} ${ym.slice(0, 4)}`;
+const addMonthsYM = (ym, n) => { const [y, m] = ym.split('-').map(Number); const d = new Date(Date.UTC(y, m - 1 + n, 1)); return d.toISOString().slice(0, 7); };
+
+function spreadOptions(n) {
+  const list = SPREAD_CHOICES.includes(n) ? SPREAD_CHOICES : [...SPREAD_CHOICES, n].sort((a, b) => a - b);
+  return list.map((k) => `<option value="${k}"${k === n ? ' selected' : ''}>${k === 1 ? 'Count once' : `Spread ${k} mo`}</option>`).join('') +
+    `<option value="${OTHER_SPREAD}">Other…</option>`;
+}
+
+// What a spread payment counts as each month, e.g. "$50.00/mo · Jan 2026 – Dec 2026".
+function spreadDetail(t) {
+  const n = t.spread_months || 1;
+  if (n <= 1) return '';
+  const start = t.date.slice(0, 7);
+  return `${money(Math.abs(Math.round((t.amount / n) * 100) / 100))}/mo · ${monthLabel(start)} – ${monthLabel(addMonthsYM(start, n - 1))}`;
+}
+
+function amountCell(t) {
+  const n = t.spread_months || 1;
+  return `<div class="${t.amount < 0 ? '' : 'pos'}">${money(t.amount)}</div>
+    <select data-f="spread_months" class="spread${n > 1 ? ' on' : ''}" title="Count this amount in one month, or split it evenly over several (e.g. a year of insurance paid up front)">${spreadOptions(n)}</select>
+    ${n > 1 ? `<div class="spread-each">${esc(spreadDetail(t))}</div>` : ''}`;
+}
+
 function renderTx() {
   const tbody = $('#txTable tbody');
   tbody.innerHTML = state.tx.map((t) => `
-    <tr data-id="${esc(t.id)}" class="${t.exclude ? 'excluded' : ''}">
+    <tr data-id="${esc(t.id)}" class="${t.exclude || catExcluded(t.category) ? 'excluded' : ''}"${!t.exclude && catExcluded(t.category) ? ` title="${esc(t.category)} isn't counted in totals"` : ''}>
       <td class="cb"><input type="checkbox" class="sel" ${state.selected.has(t.id) ? 'checked' : ''}></td>
       <td class="date">${esc(t.date)}</td>
       <td class="desc"><div class="main" title="${esc(t.description)}">${esc(t.counterparty || t.description)}${t.status === 'pending' ? '<span class="pending">pending</span>' : ''}</div>
@@ -297,7 +590,7 @@ function renderTx() {
       <td class="cat"><select data-f="category" title="Category">${catOptions(t.category)}</select></td>
       <td class="tags"><input data-f="tags" value="${esc(t.tags.split(',').filter(Boolean).join(', '))}" placeholder="add tags"></td>
       <td class="note"><input data-f="note" value="${esc(t.note)}" placeholder="add a note"></td>
-      <td class="num ${t.amount < 0 ? '' : 'pos'}">${money(t.amount)}</td>
+      <td class="num amt">${amountCell(t)}</td>
       <td><input type="checkbox" data-f="exclude" ${t.exclude ? 'checked' : ''} title="Exclude from budget totals"></td>
     </tr>`).join('');
   const empty = $('#txEmpty');
@@ -316,17 +609,35 @@ async function saveField(input) {
     value = await askNewCategory(input, tx.category);
     if (!value) return;
   }
-  const prev = field === 'exclude' ? !!tx.exclude : field === 'tags' ? tx.tags.split(',').filter(Boolean).join(', ') : tx[field];
+  if (field === 'spread_months') {
+    if (value === OTHER_SPREAD) {
+      value = await askInline(input, String(tx.spread_months || 1), { placeholder: `Months (1–${SPREAD_MAX}), then Enter`, type: 'number', min: 1, max: SPREAD_MAX });
+      if (!value) return;
+    }
+    value = Number(value);
+    if (!Number.isInteger(value) || value < 1 || value > SPREAD_MAX) return toast(`Enter a whole number of months from 1 to ${SPREAD_MAX}`, true);
+  }
+  const prev = field === 'exclude' ? !!tx.exclude : field === 'tags' ? tx.tags.split(',').filter(Boolean).join(', ')
+    : field === 'spread_months' ? tx.spread_months || 1 : tx[field];
   if (prev === value) return;
   try {
     const out = await api(`/api/transactions/${encodeURIComponent(id)}`, { method: 'PATCH', body: { [field]: value } });
     Object.assign(tx, out);
     if (field === 'tags') input.value = out.tags.split(',').filter(Boolean).join(', ');
-    if (field === 'exclude') tr.classList.toggle('excluded', !!out.exclude);
+    if (field === 'exclude' || field === 'category') tr.classList.toggle('excluded', !!out.exclude || catExcluded(out.category));
     input.closest('td').classList.remove('saved');
     void input.offsetWidth;
     input.closest('td').classList.add('saved');
     if (field === 'tags') loadMeta();
+    if (field === 'spread_months') {
+      const td = tr.querySelector('td.amt');
+      td.innerHTML = amountCell(tx);
+      td.classList.remove('saved');
+      void td.offsetWidth;
+      td.classList.add('saved');
+      toast(tx.spread_months > 1 ? `Counting ${spreadDetail(tx)}` : 'Counted once, in the month it was paid');
+      return;
+    }
     if (field === 'category') {
       const isNew = !state.meta.categories.includes(out.category);
       await loadMeta();
@@ -379,6 +690,11 @@ tbody.addEventListener('keydown', (e) => {
 function updateBulk() {
   $('#bulkBar').classList.toggle('hidden', state.selected.size === 0);
   $('#bulkCount').textContent = `${state.selected.size} selected`;
+  // Sum of the selected rows (cents math avoids floating-point drift like 0.1 + 0.2).
+  const cents = state.tx.reduce((acc, t) => acc + (state.selected.has(t.id) ? Math.round(t.amount * 100) : 0), 0);
+  const sumEl = $('#bulkSum');
+  sumEl.textContent = `Total: ${money(cents / 100)}`;
+  sumEl.classList.toggle('pos', cents > 0);
   $('#selAll').checked = state.tx.length > 0 && state.selected.size === state.tx.length;
   $('#bulkUntagMenu').classList.add('hidden');
 }
@@ -687,6 +1003,7 @@ async function loadCategoryManager() {
       <td class="name">${esc(c.name)}${c.builtin ? ' <span class="hint">built in</span>' : ''}</td>
       <td class="num">${c.count}</td>
       <td class="num">${c.budget ? money(c.budget) : '<span class="hint">–</span>'}</td>
+      <td class="center"><input type="checkbox" class="exclude-cat" ${c.excluded ? 'checked' : ''} ${c.excludeLocked ? 'disabled title="Transfers are never counted, so card payments and moves between your accounts aren\'t double counted"' : ''}></td>
       <td class="num">${c.builtin ? '' : '<button class="ghost small rename">Rename</button> <button class="ghost small del">Delete</button>'}</td>
     </tr>`).join('');
   $('#ruleList').innerHTML = rules.length
@@ -744,6 +1061,19 @@ $('#catManage').addEventListener('click', async (e) => {
     input.addEventListener('blur', () => finish(true));
   }
 });
+$('#catManage').addEventListener('change', async (e) => {
+  if (!e.target.classList.contains('exclude-cat')) return;
+  const name = e.target.closest('tr[data-name]').dataset.name;
+  const excluded = e.target.checked;
+  try {
+    await api('/api/categories/exclude', { method: 'PUT', body: { name, excluded } });
+    toast(excluded ? `“${name}” is no longer counted in totals` : `“${name}” is counted in totals again`);
+    await loadMeta();
+  } catch (err) {
+    e.target.checked = !e.target.checked;
+    toast(err.message, true);
+  }
+});
 $('#ruleList').addEventListener('click', async (e) => {
   if (!e.target.classList.contains('forget')) return;
   await api(`/api/category-rules?merchant=${encodeURIComponent(e.target.closest('.rule').dataset.merchant)}`, { method: 'DELETE' });
@@ -794,9 +1124,11 @@ $('#prevMonth').addEventListener('click', () => shiftMonth(-1));
 $('#nextMonth').addEventListener('click', () => shiftMonth(1));
 document.addEventListener('keydown', (e) => {
   if (e.target.matches('input, select, textarea')) return;
+  if (state.view === 'projections' && e.key.startsWith('Arrow')) return;
   if (e.key === 'ArrowLeft') shiftMonth(-1);
   if (e.key === 'ArrowRight') shiftMonth(1);
   if (e.key === '/') { e.preventDefault(); location.hash = 'transactions'; $('#fSearch').focus(); }
+  if (e.key === ',' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); location.hash = 'settings'; }
 });
 (async () => {
   await loadMeta();

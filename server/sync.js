@@ -76,10 +76,10 @@ function makeStatements(db) {
         bank_category=excluded.bank_category, type=excluded.type, status=excluded.status`),
     exists: db.prepare('SELECT 1 FROM transactions WHERE id=?'),
     getEdits: db.prepare(
-      'SELECT id, account_id, date, amount, counterparty, description, category, category_manual, tags, note, exclude, updated_at FROM transactions WHERE id=?'
+      'SELECT id, account_id, date, amount, counterparty, description, category, category_manual, tags, note, exclude, spread_months, updated_at FROM transactions WHERE id=?'
     ),
     copyEdits: db.prepare(
-      `UPDATE transactions SET category=?, category_manual=?, tags=?, note=?, exclude=?, updated_at=? WHERE id=?`
+      `UPDATE transactions SET category=?, category_manual=?, tags=?, note=?, exclude=?, spread_months=?, updated_at=? WHERE id=?`
     ),
     deleteTx: db.prepare('DELETE FROM transactions WHERE id=?'),
     setCursor: db.prepare('UPDATE enrollments SET cursor=? WHERE id=?'),
@@ -90,11 +90,11 @@ function makeStatements(db) {
 }
 
 function hasEdits(row) {
-  return row && (row.updated_at || row.category_manual || row.tags || row.note || row.exclude);
+  return row && (row.updated_at || row.category_manual || row.tags || row.note || row.exclude || row.spread_months > 1);
 }
 
 const copyEditsTo = (st, from, toId) =>
-  st.copyEdits.run(from.category, from.category_manual || 0, from.tags, from.note, from.exclude, from.updated_at, toId);
+  st.copyEdits.run(from.category, from.category_manual || 0, from.tags, from.note, from.exclude, from.spread_months || 1, from.updated_at, toId);
 
 // Some banks post a pending charge under a new id without saying which pending one it replaces.
 // Before an edited transaction is deleted, move its edits to the closest new one on the same

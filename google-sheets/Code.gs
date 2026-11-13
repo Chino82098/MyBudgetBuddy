@@ -24,11 +24,11 @@ function doPost(e) {
     // Transactions tab
     const sheet = ss.getSheetByName(name) || ss.insertSheet(name);
     sheet.clear();
-    const header = ['Date', 'Description', 'Counterparty', 'Amount', 'Category', 'Tags', 'Note', 'Account', 'Status', 'Excluded', 'ID'];
+    const header = ['Date', 'Description', 'Counterparty', 'Amount', 'Category', 'Tags', 'Note', 'Account', 'Status', 'Excluded', 'Spread (months)', 'ID'];
     const rows = (data.transactions || []).map(function (t) {
       return [t.date, t.description, t.counterparty || '', Number(t.amount), t.category || '',
         (t.tags || '').split(',').filter(String).join(', '), t.note || '', t.account || '',
-        t.status || '', t.excluded ? 'yes' : '', t.id];
+        t.status || '', t.excluded ? 'yes' : '', t.spread_months > 1 ? t.spread_months : '', t.id];
     });
     sheet.getRange(1, 1, 1, header.length).setValues([header]).setFontWeight('bold');
     if (rows.length) {

@@ -11,6 +11,7 @@ const { syncAll } = require('./sync');
 const { postToSheet } = require('./sheets');
 const demo = require('./demo');
 const categories = require('./categories');
+const projections = require('./projections');
 
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png' };
@@ -87,6 +88,35 @@ function csvCell(v) {
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
+// ---------- spreading a payment over several months ----------
+// A transaction with spread_months = N > 1 (e.g. 6 months of car insurance paid up front) counts as N equal
+// monthly parts in totals, budgets, charts and Projections: one part in its own month, one in each month after,
+// on the same day of the month (or the month's last day). Cents left over from rounding go on the last part.
+// Used in place of "transactions t" anywhere amounts are added up. paid_date / paid_amount are the original.
+const SPREAD_MAX = 60;
+const TX_EFFECTIVE = `(
+  WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < ${SPREAD_MAX - 1})
+  SELECT id, account_id, category, tags, exclude, description, counterparty, date, amount,
+         date AS paid_date, amount AS paid_amount, 1 AS part, 1 AS spread_months
+  FROM transactions WHERE COALESCE(spread_months, 1) <= 1
+  UNION ALL
+  SELECT t.id, t.account_id, t.category, t.tags, t.exclude, t.description, t.counterparty,
+         date(t.date, 'start of month', '+' || n.i || ' months',
+              '+' || (MIN(CAST(strftime('%d', t.date) AS INTEGER),
+                          CAST(strftime('%d', t.date, 'start of month', '+' || (n.i + 1) || ' months', '-1 day') AS INTEGER)) - 1) || ' days'),
+         CASE WHEN n.i < t.spread_months - 1 THEN ROUND(t.amount / t.spread_months, 2)
+              ELSE ROUND(t.amount - ROUND(t.amount / t.spread_months, 2) * (t.spread_months - 1), 2) END,
+         t.date, t.amount, n.i + 1, t.spread_months
+  FROM transactions t JOIN n ON n.i < t.spread_months
+  WHERE t.spread_months > 1
+)`;
+
+// 1 (count once) .. SPREAD_MAX months; null if not a whole number in range.
+function spreadMonths(v) {
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 1 && n <= SPREAD_MAX ? n : null;
+}
+
 // ---------- queries ----------
 function parseAmount(input) {
   const raw = String(input ?? '').replace(/[$,\s]/g, '').replace(/^[-+]/, '');
@@ -140,7 +170,7 @@ function queryTransactions(db, q) {
     .prepare(
       `SELECT t.id, t.account_id, a.name AS account_name, a.institution, t.date, ${AMT} AS amount,
               t.description, t.counterparty, t.bank_category, t.type, t.status, t.category,
-              t.tags, t.note, t.exclude
+              t.tags, t.note, t.exclude, COALESCE(t.spread_months, 1) AS spread_months
        FROM transactions t JOIN accounts a ON a.id=t.account_id
        WHERE ${where.join(' AND ')}
        ORDER BY t.date DESC, t.id DESC
@@ -152,48 +182,66 @@ function queryTransactions(db, q) {
 // q: { month: 'YYYY-MM' } or { from: 'YYYY-MM-DD', to: 'YYYY-MM-DD' }
 function summary(db, q) {
   if (typeof q === 'string') q = { month: q };
-  const range = dateRange(q);
-  if (!range) throw Object.assign(new Error('month (YYYY-MM) or from/to (YYYY-MM-DD) required'), { status: 400 });
-  const months = budgetMonths(range);
-  const base = `FROM transactions t JOIN accounts a ON a.id=t.account_id
-    WHERE a.hidden=0 AND t.exclude=0 AND t.category<>'Transfer' AND t.date BETWEEN ? AND ?`;
+  const dates = dateRange(q);
+  if (!dates) throw Object.assign(new Error('month (YYYY-MM) or from/to (YYYY-MM-DD) required'), { status: 400 });
+  const months = budgetMonths(dates);
+  // Left out: hidden accounts (and, for Projections, accounts you left out there), rows with Skip ticked, Transfer and any category you've excluded.
+  const skipCats = categories.excluded(db);
+  // Spread payments count only the parts that fall in this range (see TX_EFFECTIVE).
+  const base = `FROM ${TX_EFFECTIVE} t JOIN accounts a ON a.id=t.account_id
+    WHERE a.hidden=0${q.projection === true ? ' AND a.in_projections=1' : ''} AND t.exclude=0 AND t.category IS NOT NULL
+      AND t.category NOT IN (${skipCats.map(() => '?').join(',')}) AND t.date BETWEEN ? AND ?`;
+  const range = [...skipCats, ...dates]; // the base query's parameters, in order
+  // Income = only rows categorized Income. Everything else counts toward spending,
+  // so refunds/returns (positive amounts in other categories) lower spending.
   const totals = db
     .prepare(
-      `SELECT COALESCE(SUM(CASE WHEN ${AMT}>0 THEN ${AMT} END),0) AS income,
-              COALESCE(SUM(CASE WHEN ${AMT}<0 THEN -${AMT} END),0) AS spending,
+      `SELECT COALESCE(SUM(CASE WHEN t.category='Income' THEN ${AMT} END),0) AS income,
+              COALESCE(SUM(CASE WHEN t.category<>'Income' THEN -${AMT} END),0) AS spending,
               COUNT(*) AS count ${base}`
     )
     .get(...range);
   const byCategory = db
     .prepare(
-      `SELECT t.category, SUM(-${AMT}) AS spent, COUNT(*) AS count ${base} AND ${AMT}<0
-       GROUP BY t.category ORDER BY spent DESC`
+      `SELECT t.category, SUM(-${AMT}) AS spent, COUNT(*) AS count ${base} AND t.category<>'Income'
+       GROUP BY t.category HAVING ABS(SUM(-${AMT})) >= 0.005 ORDER BY spent DESC`
     )
     .all(...range);
   const budgets = Object.fromEntries(db.prepare('SELECT * FROM budgets').all().map((b) => [b.category, b.monthly_limit]));
   const seen = new Set(byCategory.map((c) => c.category));
-  for (const cat of Object.keys(budgets)) if (!seen.has(cat)) byCategory.push({ category: cat, spent: 0, count: 0 });
+  for (const cat of Object.keys(budgets)) if (!seen.has(cat) && !skipCats.includes(cat)) byCategory.push({ category: cat, spent: 0, count: 0 });
   // Budgets are monthly; scale them to the length of the range (a year = 12x).
   for (const c of byCategory) c.budget = budgets[c.category] != null ? Math.round(budgets[c.category] * months * 100) / 100 : null;
 
   const byTag = {};
-  for (const row of db.prepare(`SELECT t.tags, ${AMT} AS amt ${base} AND t.tags<>''`).all(...range)) {
+  for (const row of db.prepare(`SELECT t.tags, t.category, ${AMT} AS amt ${base} AND t.tags<>''`).all(...range)) {
     for (const tag of row.tags.split(',')) {
       byTag[tag] = byTag[tag] || { tag, spent: 0, count: 0 };
-      byTag[tag].spent += row.amt < 0 ? -row.amt : 0;
+      if (row.category !== 'Income') byTag[tag].spent -= row.amt;
       byTag[tag].count++;
     }
   }
   // Long ranges are charted by month, short ones by day.
-  const granularity = daysBetween(...range) > 62 ? 'month' : 'day';
+  const granularity = daysBetween(...dates) > 62 ? 'month' : 'day';
   const bucket = granularity === 'month' ? 'substr(t.date, 1, 7)' : 't.date';
   const daily = db
-    .prepare(`SELECT ${bucket} AS date, SUM(-${AMT}) AS spent ${base} AND ${AMT}<0 GROUP BY 1 ORDER BY 1`)
+    .prepare(`SELECT ${bucket} AS date, SUM(-${AMT}) AS spent ${base} AND t.category<>'Income' GROUP BY 1 ORDER BY 1`)
     .all(...range);
+  // Spread payments with a part in this range, so the UI can explain why a total isn't the full amount paid.
+  const spread = db
+    .prepare(
+      `SELECT t.id, COALESCE(NULLIF(t.counterparty, ''), t.description) AS name, t.category, t.paid_date,
+              CASE WHEN a.invert_sign=1 THEN -t.paid_amount ELSE t.paid_amount END AS paid,
+              SUM(${AMT}) AS amount, MIN(t.part) AS first_part, MAX(t.part) AS last_part, t.spread_months
+       ${base} AND t.spread_months > 1 GROUP BY t.id ORDER BY t.paid_date, t.id`
+    )
+    .all(...range)
+    .map((r) => ({ ...r, amount: Math.round(r.amount * 100) / 100 }));
   return {
     month: q.month && monthRange(q.month) ? q.month : null,
-    from: range[0],
-    to: range[1],
+    from: dates[0],
+    to: dates[1],
+    excludedCategories: skipCats,
     months,
     granularity,
     income: totals.income,
@@ -203,6 +251,7 @@ function summary(db, q) {
     byCategory,
     byTag: Object.values(byTag).sort((a, b) => b.spent - a.spent),
     daily,
+    spread,
   };
 }
 
@@ -282,6 +331,7 @@ function createApp(opts = {}) {
     const b = await readJson(req);
     if (b.invert_sign !== undefined) db.prepare('UPDATE accounts SET invert_sign=? WHERE id=?').run(b.invert_sign ? 1 : 0, m[1]);
     if (b.hidden !== undefined) db.prepare('UPDATE accounts SET hidden=? WHERE id=?').run(b.hidden ? 1 : 0, m[1]);
+    if (b.in_projections !== undefined) db.prepare('UPDATE accounts SET in_projections=? WHERE id=?').run(b.in_projections ? 1 : 0, m[1]);
     return { ok: true };
   });
 
@@ -309,9 +359,14 @@ function createApp(opts = {}) {
     if (b.tags !== undefined) sets.push('tags=?') && params.push(normTags(b.tags));
     if (b.note !== undefined) sets.push('note=?') && params.push(String(b.note));
     if (b.exclude !== undefined) sets.push('exclude=?') && params.push(b.exclude ? 1 : 0);
+    if (b.spread_months !== undefined) {
+      const n = spreadMonths(b.spread_months);
+      if (n === null) throw Object.assign(new Error(`Spread must be a whole number of months from 1 to ${SPREAD_MAX}`), { status: 400 });
+      sets.push('spread_months=?') && params.push(n);
+    }
     if (!sets.length) return { ok: true };
     db.prepare(`UPDATE transactions SET ${sets.join(', ')}, updated_at=datetime('now') WHERE id=?`).run(...params, m[1]);
-    const out = db.prepare('SELECT id, category, tags, note, exclude FROM transactions WHERE id=?').get(m[1]);
+    const out = db.prepare('SELECT id, category, tags, note, exclude, spread_months FROM transactions WHERE id=?').get(m[1]);
     if (cat !== undefined) {
       // Remember this merchant for future syncs, and tell the UI how many look-alikes could follow.
       out.merchant = categories.learn(db, row, cat);
@@ -363,7 +418,7 @@ function createApp(opts = {}) {
     for (const r of db.prepare("SELECT tags FROM transactions WHERE tags<>''").all()) r.tags.split(',').forEach((t) => tags.add(t));
     const budgets = db.prepare('SELECT * FROM budgets ORDER BY category').all();
     for (const b of budgets) categories.ensure(db, b.category);
-    return { categories: categories.list(db), tags: [...tags].sort(), budgets };
+    return { categories: categories.list(db), tags: [...tags].sort(), budgets, excluded: categories.excluded(db) };
   });
   // Category manager (Settings): counts, budgets and remembered merchants.
   route('GET', /^\/api\/categories\/manage$/, () => {
@@ -371,9 +426,11 @@ function createApp(opts = {}) {
       db.prepare('SELECT category, COUNT(*) AS n FROM transactions GROUP BY category').all().map((r) => [r.category, r.n])
     );
     const budgets = Object.fromEntries(db.prepare('SELECT * FROM budgets').all().map((b) => [b.category, b.monthly_limit]));
+    const skip = new Set(categories.excluded(db));
     return {
       categories: categories.list(db).map((name) => ({
         name, count: counts[name] || 0, budget: budgets[name] ?? null, builtin: categories.BUILTIN.includes(name),
+        excluded: skip.has(name), excludeLocked: categories.ALWAYS_EXCLUDED.includes(name),
       })),
       rules: db.prepare('SELECT merchant, category FROM category_rules ORDER BY merchant').all(),
     };
@@ -386,6 +443,12 @@ function createApp(opts = {}) {
   route('PATCH', /^\/api\/categories$/, async (req) => {
     const b = await readJson(req);
     return { name: categories.rename(db, String(b.from || ''), b.to) };
+  });
+  // Count a category in totals or leave it out: { name, excluded: true|false }
+  route('PUT', /^\/api\/categories\/exclude$/, async (req) => {
+    const b = await readJson(req);
+    const name = categories.setExcluded(db, b.name, !!b.excluded);
+    return { name, excluded: !!b.excluded, excludedCategories: categories.excluded(db) };
   });
   route('DELETE', /^\/api\/categories$/, (req, m, url) => ({ moved: categories.remove(db, url.searchParams.get('name') || '') }));
   route('DELETE', /^\/api\/category-rules$/, (req, m, url) => {
@@ -401,15 +464,25 @@ function createApp(opts = {}) {
     return { ok: true };
   });
 
+  // Projections: ?period=month|year&today=YYYY-MM-DD (your local date)
+  route('GET', /^\/api\/projections$/, (req, m, url) => projections.project(db, Object.fromEntries(url.searchParams), summary));
+  route('POST', /^\/api\/income-streams$/, async (req) => projections.addStream(db, await readJson(req)));
+  route('PUT', /^\/api\/income-streams$/, async (req) => projections.saveStream(db, await readJson(req)));
+  // A paycheck you added is deleted; a detected one goes back to what was detected.
+  route('DELETE', /^\/api\/income-streams$/, (req, m, url) => {
+    db.prepare('DELETE FROM income_streams WHERE key=?').run(url.searchParams.get('key') || '');
+    return { ok: true };
+  });
+
   route('GET', /^\/api\/summary$/, (req, m, url) => summary(db, Object.fromEntries(url.searchParams)));
 
   route('GET', /^\/api\/export\.csv$/, (req, m, url) => {
     const rows = queryTransactions(db, Object.fromEntries(url.searchParams));
-    const head = ['Date', 'Description', 'Counterparty', 'Amount', 'Category', 'Tags', 'Note', 'Account', 'Status', 'Excluded'];
+    const head = ['Date', 'Description', 'Counterparty', 'Amount', 'Category', 'Tags', 'Note', 'Account', 'Status', 'Excluded', 'Spread (months)'];
     const lines = [head.join(',')].concat(
       rows.map((r) =>
         [r.date, r.description, r.counterparty, r.amount.toFixed(2), r.category, r.tags.replace(/,/g, ' '), r.note,
-          `${r.institution || ''} ${r.account_name || ''}`.trim(), r.status, r.exclude ? 'yes' : '']
+          `${r.institution || ''} ${r.account_name || ''}`.trim(), r.status, r.exclude ? 'yes' : '', r.spread_months > 1 ? r.spread_months : '']
           .map(csvCell).join(',')
       )
     );
@@ -434,7 +507,7 @@ function createApp(opts = {}) {
       transactions: tx.map((r) => ({
         date: r.date, description: r.description, counterparty: r.counterparty, amount: r.amount,
         category: r.category, tags: r.tags, note: r.note, account: `${r.institution || ''} ${r.account_name || ''}`.trim(),
-        status: r.status, excluded: !!r.exclude, id: r.id,
+        status: r.status, excluded: !!r.exclude, spread_months: r.spread_months, id: r.id,
       })),
       summary: s && { income: s.income, spending: s.spending, net: s.net, byCategory: s.byCategory, byTag: s.byTag },
     });
@@ -486,7 +559,7 @@ function start(port = Number(process.env.PORT) || 4757, opts) {
   });
 }
 
-module.exports = { start, createApp };
+module.exports = { start, createApp, __test: { summaryFor: summary, SPREAD_MAX } };
 
 if (require.main === module) {
   start()

@@ -12,11 +12,11 @@
     <div class="brand"><span class="logo">$</span> Budget Buddy</div>
     <nav>
       <a href="#dashboard" data-view="dashboard">Dashboard</a>
+      <a href="#projections" data-view="projections">Projections</a>
       <a href="#transactions" data-view="transactions">Transactions</a>
       <a href="#categories" data-view="categories">Categories</a>
       <a href="#accounts" data-view="accounts">Accounts</a>
       <a href="#export" data-view="export">Export</a>
-      <a href="#settings" data-view="settings">Settings</a>
     </nav>
     <div class="sidebar-foot">
       <button id="syncBtn">↻ Sync</button>
@@ -65,6 +65,8 @@
         <div class="card">
           <h3>Spending by category <span class="hint" id="budgetHint">click a budget to edit it</span></h3>
           <div id="catList"></div>
+          <div class="hint excluded-note" id="excludedNote"></div>
+          <div class="hint excluded-note" id="spreadNote"></div>
           <form id="addBudget" class="inline-form">
             <input name="category" list="categoryOptions" placeholder="Category" required />
             <input name="limit" type="number" min="0" step="1" placeholder="Monthly budget $" required />
@@ -76,6 +78,67 @@
           <div id="tagList"></div>
         </div>
       </div>
+    </section>
+
+    <section id="view-projections" class="view">
+      <div class="proj-head">
+        <div class="seg" role="group" aria-label="Projection period">
+          <button data-period="month" class="active">Month</button>
+          <button data-period="year">Year</button>
+        </div>
+        <span class="hint" id="projAsOf"></span>
+        <button class="icon proj-gear" id="projSettingsBtn" title="Projection settings" aria-label="Projection settings" aria-haspopup="dialog">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
+        </button>
+      </div>
+      <div class="tiles tiles4">
+        <div class="tile"><div class="label">Projected income</div><div class="value pos" id="pIncome">–</div><div class="sub" id="pIncomeSub"></div></div>
+        <div class="tile"><div class="label">Spent so far</div><div class="value" id="pSpent">–</div><div class="sub" id="pSpentSub"></div></div>
+        <div class="tile featured"><div class="label">Left to spend</div><div class="value" id="pLeft">–</div><div class="sub" id="pLeftSub"></div></div>
+        <div class="tile"><div class="label" id="pBalLabel">Bank balance at month end</div><div class="value" id="pBal">–</div><div class="sub" id="pBalSub"></div></div>
+      </div>
+      <div class="grid2 even">
+        <div class="card">
+          <h3>Left to spend</h3>
+          <div id="pMath" class="math"></div>
+        </div>
+        <div class="card">
+          <h3>Bank balance <span class="hint">checking &amp; savings</span></h3>
+          <div id="pBalMath" class="math"></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Budgets <span class="hint" id="projBudgetHint">monthly amounts; type one in to set it, clear it to remove</span></h3>
+        <table class="simple" id="projBudgets">
+          <thead><tr><th>Category</th><th class="num" id="pbSpentHead">Spent so far</th><th class="num">Monthly budget</th><th class="num yr">Year budget</th><th class="bar-col"></th><th class="num" id="pbProjHead">Projected</th><th class="num">Left in budget</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <form id="projAddBudget" class="inline-form">
+          <select name="category" required><option value="">Add a budget for…</option></select>
+          <input name="limit" type="number" min="0" step="1" placeholder="Monthly budget $" required />
+          <button>Set budget</button>
+        </form>
+        <p class="hint" id="projNote"></p>
+      </div>
+      <dialog id="projSettings" class="drawer" aria-labelledby="projSettingsTitle">
+        <div class="drawer-head">
+          <h2 id="projSettingsTitle">Projection settings</h2>
+          <button class="icon" id="projSettingsClose" title="Close (Esc)" aria-label="Close">✕</button>
+        </div>
+        <div class="card">
+          <h3>Accounts counted <span class="hint" id="projAcctCount"></span><span class="hint">untick an account to leave its balance, paychecks and spending out of these projections</span></h3>
+          <div id="projAccounts" class="acct-chips"></div>
+        </div>
+        <div class="card">
+          <h3>Paychecks <span class="hint">found from your Income transactions. Change any value to adjust the projection. If a paycheck changes size (hours, overtime, holiday pay), pick how to estimate it under its amount.</span></h3>
+          <table class="simple" id="streamTable">
+            <thead><tr><th class="center" title="Count this paycheck in the projection">Use</th><th>Source</th><th>How often</th><th class="num">Each paycheck</th><th>Next payday</th><th class="num" id="streamPeriodHead">Still to come</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <div id="streamEmpty" class="hint hidden"></div>
+          <div class="row-actions"><button id="addStream" class="ghost">+ Add income</button></div>
+        </div>
+      </dialog>
     </section>
 
     <section id="view-transactions" class="view">
@@ -90,6 +153,7 @@
       </div>
       <div id="bulkBar" class="bulk hidden">
         <span id="bulkCount"></span>
+        <span id="bulkSum" class="bulk-sum" title="Sum of the selected transactions"></span>
         <input id="bulkTag" placeholder="add tag(s)" autocomplete="off" />
         <button id="bulkTagBtn">Add tags</button>
         <span class="menu-wrap">
@@ -119,13 +183,13 @@
     <section id="view-categories" class="view">
       <div class="card settings-wide">
         <h3>Categories</h3>
-        <p class="hint">Add your own, rename (renaming onto an existing name merges the two), or delete. A category you set on a transaction is never changed by a sync.</p>
+        <p class="hint">Add your own, rename (renaming onto an existing name merges the two), or delete. A category you set on a transaction is never changed by a sync. Tick <strong>Excluded</strong> to leave a category out of income, spending, charts and budgets (its transactions stay in the list and exports).</p>
         <form id="addCategory" class="inline-form">
           <input name="name" placeholder="New category name" maxlength="60" required />
           <button>Add category</button>
         </form>
         <table class="simple" id="catManage">
-          <thead><tr><th>Category</th><th class="num">Transactions</th><th class="num">Budget</th><th></th></tr></thead>
+          <thead><tr><th>Category</th><th class="num">Transactions</th><th class="num">Budget</th><th class="center" title="Leave this category out of income, spending and budgets">Excluded</th><th></th></tr></thead>
           <tbody></tbody>
         </table>
         <h3>Remembered merchants</h3>
