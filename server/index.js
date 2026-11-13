@@ -11,6 +11,7 @@ const { syncAll } = require('./sync');
 const { postToSheet } = require('./sheets');
 const demo = require('./demo');
 const categories = require('./categories');
+const projections = require('./projections');
 
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png' };
@@ -152,48 +153,55 @@ function queryTransactions(db, q) {
 // q: { month: 'YYYY-MM' } or { from: 'YYYY-MM-DD', to: 'YYYY-MM-DD' }
 function summary(db, q) {
   if (typeof q === 'string') q = { month: q };
-  const range = dateRange(q);
-  if (!range) throw Object.assign(new Error('month (YYYY-MM) or from/to (YYYY-MM-DD) required'), { status: 400 });
-  const months = budgetMonths(range);
+  const dates = dateRange(q);
+  if (!dates) throw Object.assign(new Error('month (YYYY-MM) or from/to (YYYY-MM-DD) required'), { status: 400 });
+  const months = budgetMonths(dates);
+  // Left out: hidden accounts (and, for Projections, accounts you left out there), rows with Skip ticked, Transfer and any category you've excluded.
+  const skipCats = categories.excluded(db);
   const base = `FROM transactions t JOIN accounts a ON a.id=t.account_id
-    WHERE a.hidden=0 AND t.exclude=0 AND t.category<>'Transfer' AND t.date BETWEEN ? AND ?`;
+    WHERE a.hidden=0${q.projection === true ? ' AND a.in_projections=1' : ''} AND t.exclude=0 AND t.category IS NOT NULL
+      AND t.category NOT IN (${skipCats.map(() => '?').join(',')}) AND t.date BETWEEN ? AND ?`;
+  const range = [...skipCats, ...dates]; // the base query's parameters, in order
+  // Income = only rows categorized Income. Everything else counts toward spending,
+  // so refunds/returns (positive amounts in other categories) lower spending.
   const totals = db
     .prepare(
-      `SELECT COALESCE(SUM(CASE WHEN ${AMT}>0 THEN ${AMT} END),0) AS income,
-              COALESCE(SUM(CASE WHEN ${AMT}<0 THEN -${AMT} END),0) AS spending,
+      `SELECT COALESCE(SUM(CASE WHEN t.category='Income' THEN ${AMT} END),0) AS income,
+              COALESCE(SUM(CASE WHEN t.category<>'Income' THEN -${AMT} END),0) AS spending,
               COUNT(*) AS count ${base}`
     )
     .get(...range);
   const byCategory = db
     .prepare(
-      `SELECT t.category, SUM(-${AMT}) AS spent, COUNT(*) AS count ${base} AND ${AMT}<0
-       GROUP BY t.category ORDER BY spent DESC`
+      `SELECT t.category, SUM(-${AMT}) AS spent, COUNT(*) AS count ${base} AND t.category<>'Income'
+       GROUP BY t.category HAVING ABS(SUM(-${AMT})) >= 0.005 ORDER BY spent DESC`
     )
     .all(...range);
   const budgets = Object.fromEntries(db.prepare('SELECT * FROM budgets').all().map((b) => [b.category, b.monthly_limit]));
   const seen = new Set(byCategory.map((c) => c.category));
-  for (const cat of Object.keys(budgets)) if (!seen.has(cat)) byCategory.push({ category: cat, spent: 0, count: 0 });
+  for (const cat of Object.keys(budgets)) if (!seen.has(cat) && !skipCats.includes(cat)) byCategory.push({ category: cat, spent: 0, count: 0 });
   // Budgets are monthly; scale them to the length of the range (a year = 12x).
   for (const c of byCategory) c.budget = budgets[c.category] != null ? Math.round(budgets[c.category] * months * 100) / 100 : null;
 
   const byTag = {};
-  for (const row of db.prepare(`SELECT t.tags, ${AMT} AS amt ${base} AND t.tags<>''`).all(...range)) {
+  for (const row of db.prepare(`SELECT t.tags, t.category, ${AMT} AS amt ${base} AND t.tags<>''`).all(...range)) {
     for (const tag of row.tags.split(',')) {
       byTag[tag] = byTag[tag] || { tag, spent: 0, count: 0 };
-      byTag[tag].spent += row.amt < 0 ? -row.amt : 0;
+      if (row.category !== 'Income') byTag[tag].spent -= row.amt;
       byTag[tag].count++;
     }
   }
   // Long ranges are charted by month, short ones by day.
-  const granularity = daysBetween(...range) > 62 ? 'month' : 'day';
+  const granularity = daysBetween(...dates) > 62 ? 'month' : 'day';
   const bucket = granularity === 'month' ? 'substr(t.date, 1, 7)' : 't.date';
   const daily = db
-    .prepare(`SELECT ${bucket} AS date, SUM(-${AMT}) AS spent ${base} AND ${AMT}<0 GROUP BY 1 ORDER BY 1`)
+    .prepare(`SELECT ${bucket} AS date, SUM(-${AMT}) AS spent ${base} AND t.category<>'Income' GROUP BY 1 ORDER BY 1`)
     .all(...range);
   return {
     month: q.month && monthRange(q.month) ? q.month : null,
-    from: range[0],
-    to: range[1],
+    from: dates[0],
+    to: dates[1],
+    excludedCategories: skipCats,
     months,
     granularity,
     income: totals.income,
@@ -282,6 +290,7 @@ function createApp(opts = {}) {
     const b = await readJson(req);
     if (b.invert_sign !== undefined) db.prepare('UPDATE accounts SET invert_sign=? WHERE id=?').run(b.invert_sign ? 1 : 0, m[1]);
     if (b.hidden !== undefined) db.prepare('UPDATE accounts SET hidden=? WHERE id=?').run(b.hidden ? 1 : 0, m[1]);
+    if (b.in_projections !== undefined) db.prepare('UPDATE accounts SET in_projections=? WHERE id=?').run(b.in_projections ? 1 : 0, m[1]);
     return { ok: true };
   });
 
@@ -363,7 +372,7 @@ function createApp(opts = {}) {
     for (const r of db.prepare("SELECT tags FROM transactions WHERE tags<>''").all()) r.tags.split(',').forEach((t) => tags.add(t));
     const budgets = db.prepare('SELECT * FROM budgets ORDER BY category').all();
     for (const b of budgets) categories.ensure(db, b.category);
-    return { categories: categories.list(db), tags: [...tags].sort(), budgets };
+    return { categories: categories.list(db), tags: [...tags].sort(), budgets, excluded: categories.excluded(db) };
   });
   // Category manager (Settings): counts, budgets and remembered merchants.
   route('GET', /^\/api\/categories\/manage$/, () => {
@@ -371,9 +380,11 @@ function createApp(opts = {}) {
       db.prepare('SELECT category, COUNT(*) AS n FROM transactions GROUP BY category').all().map((r) => [r.category, r.n])
     );
     const budgets = Object.fromEntries(db.prepare('SELECT * FROM budgets').all().map((b) => [b.category, b.monthly_limit]));
+    const skip = new Set(categories.excluded(db));
     return {
       categories: categories.list(db).map((name) => ({
         name, count: counts[name] || 0, budget: budgets[name] ?? null, builtin: categories.BUILTIN.includes(name),
+        excluded: skip.has(name), excludeLocked: categories.ALWAYS_EXCLUDED.includes(name),
       })),
       rules: db.prepare('SELECT merchant, category FROM category_rules ORDER BY merchant').all(),
     };
@@ -387,6 +398,12 @@ function createApp(opts = {}) {
     const b = await readJson(req);
     return { name: categories.rename(db, String(b.from || ''), b.to) };
   });
+  // Count a category in totals or leave it out: { name, excluded: true|false }
+  route('PUT', /^\/api\/categories\/exclude$/, async (req) => {
+    const b = await readJson(req);
+    const name = categories.setExcluded(db, b.name, !!b.excluded);
+    return { name, excluded: !!b.excluded, excludedCategories: categories.excluded(db) };
+  });
   route('DELETE', /^\/api\/categories$/, (req, m, url) => ({ moved: categories.remove(db, url.searchParams.get('name') || '') }));
   route('DELETE', /^\/api\/category-rules$/, (req, m, url) => {
     db.prepare('DELETE FROM category_rules WHERE merchant=?').run(url.searchParams.get('merchant') || '');
@@ -398,6 +415,16 @@ function createApp(opts = {}) {
     if (!b.category) throw Object.assign(new Error('category required'), { status: 400 });
     if (!limit || limit <= 0) db.prepare('DELETE FROM budgets WHERE category=?').run(b.category);
     else db.prepare('INSERT INTO budgets VALUES (?, ?) ON CONFLICT(category) DO UPDATE SET monthly_limit=excluded.monthly_limit').run(b.category, limit);
+    return { ok: true };
+  });
+
+  // Projections: ?period=month|year&today=YYYY-MM-DD (your local date)
+  route('GET', /^\/api\/projections$/, (req, m, url) => projections.project(db, Object.fromEntries(url.searchParams), summary));
+  route('POST', /^\/api\/income-streams$/, async (req) => projections.addStream(db, await readJson(req)));
+  route('PUT', /^\/api\/income-streams$/, async (req) => projections.saveStream(db, await readJson(req)));
+  // A paycheck you added is deleted; a detected one goes back to what was detected.
+  route('DELETE', /^\/api\/income-streams$/, (req, m, url) => {
+    db.prepare('DELETE FROM income_streams WHERE key=?').run(url.searchParams.get('key') || '');
     return { ok: true };
   });
 
@@ -486,7 +513,7 @@ function start(port = Number(process.env.PORT) || 4757, opts) {
   });
 }
 
-module.exports = { start, createApp };
+module.exports = { start, createApp, __test: { summaryFor: summary } };
 
 if (require.main === module) {
   start()

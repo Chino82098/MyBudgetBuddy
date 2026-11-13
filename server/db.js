@@ -36,7 +36,8 @@ function open(dataDir) {
       balance_available TEXT,
       balance_ledger TEXT,
       invert_sign INTEGER DEFAULT 0,
-      hidden INTEGER DEFAULT 0
+      hidden INTEGER DEFAULT 0,
+      in_projections INTEGER DEFAULT 1
     );
 
     CREATE TABLE IF NOT EXISTS transactions (
@@ -64,6 +65,20 @@ function open(dataDir) {
     CREATE TABLE IF NOT EXISTS budgets (
       category TEXT PRIMARY KEY,
       monthly_limit REAL NOT NULL
+    );
+
+    -- Paychecks for Projections: your changes to a detected paycheck (NULL = use what was detected),
+    -- or one you added yourself (manual=1).
+    CREATE TABLE IF NOT EXISTS income_streams (
+      key TEXT PRIMARY KEY,          -- payer (merchant key) or manual:<id>
+      name TEXT,
+      amount REAL,
+      frequency TEXT,                -- weekly | biweekly | semimonthly | monthly
+      next_date TEXT,
+      enabled INTEGER,
+      manual INTEGER DEFAULT 0,
+      estimate TEXT,                 -- how to estimate a paycheck that varies (NULL = default)
+      updated_at TEXT
     );
 
     -- Remembered merchants: new transactions from this merchant get this category on sync.
@@ -100,6 +115,11 @@ function migrate(db) {
     const inUse = db.prepare('SELECT DISTINCT category AS c FROM transactions WHERE category IS NOT NULL UNION SELECT category FROM budgets').all();
     for (const n of [...BUILTIN, ...DEFAULTS, ...inUse.map((r) => r.c)]) add.run(n);
   }
+  // 1 = leave this category out of income/spending totals, charts and budgets (set in Categories).
+  if (!cols('categories').includes('exclude')) db.exec('ALTER TABLE categories ADD COLUMN exclude INTEGER DEFAULT 0');
+  // 0 = leave this account out of Projections (its balance, paychecks and spending).
+  if (!cols('accounts').includes('in_projections')) db.exec('ALTER TABLE accounts ADD COLUMN in_projections INTEGER DEFAULT 1');
+  if (!cols('income_streams').includes('estimate')) db.exec('ALTER TABLE income_streams ADD COLUMN estimate TEXT');
   if (cols('transactions').includes('teller_category')) {
     db.exec('ALTER TABLE transactions RENAME COLUMN teller_category TO bank_category');
   }

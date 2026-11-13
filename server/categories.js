@@ -2,7 +2,8 @@
 // Categories the user can pick from, plus "remembered merchants": when you set a category on a
 // transaction, new transactions from the same merchant get that category on future syncs.
 
-const BUILTIN = ['Transfer', 'Uncategorized']; // Transfer is left out of spending totals; neither can be deleted.
+const BUILTIN = ['Transfer', 'Uncategorized']; // Transfer is always left out of spending totals; neither can be deleted.
+const ALWAYS_EXCLUDED = ['Transfer'];
 const DEFAULTS = [
   'Dining', 'Entertainment', 'Fees', 'Fuel', 'Groceries', 'Health', 'Home', 'Income', 'Insurance',
   'Loan Payments', 'Personal Care', 'Services', 'Shopping', 'Taxes & Donations', 'Transport', 'Travel', 'Utilities',
@@ -90,6 +91,21 @@ function rename(db, from, to) {
   }
 }
 
+// Categories left out of totals: Transfer, plus any you've switched off in Categories.
+function excluded(db) {
+  const names = db.prepare('SELECT name FROM categories WHERE exclude=1').all().map((r) => r.name);
+  return [...new Set([...ALWAYS_EXCLUDED, ...names])].sort((a, b) => a.localeCompare(b));
+}
+
+function setExcluded(db, name, on) {
+  const n = cleanName(name);
+  if (!n) throw Object.assign(new Error('Category name required'), { status: 400 });
+  if (ALWAYS_EXCLUDED.includes(n)) throw Object.assign(new Error(`“${n}” is always left out of totals`), { status: 400 });
+  const stored = ensure(db, n);
+  db.prepare('UPDATE categories SET exclude=? WHERE name=?').run(on ? 1 : 0, stored);
+  return stored;
+}
+
 // Deleting moves its transactions to Uncategorized and drops its budget and remembered merchants.
 function remove(db, name) {
   if (BUILTIN.includes(name)) throw Object.assign(new Error(`“${name}” is built in and can't be deleted`), { status: 400 });
@@ -102,4 +118,7 @@ function remove(db, name) {
   return moved;
 }
 
-module.exports = { BUILTIN, DEFAULTS, merchantKey, cleanName, ensure, list, learn, ruleFor, similar, rename, remove };
+module.exports = {
+  BUILTIN, DEFAULTS, ALWAYS_EXCLUDED, merchantKey, cleanName, ensure, list, learn, ruleFor, similar, rename, remove,
+  excluded, setExcluded,
+};

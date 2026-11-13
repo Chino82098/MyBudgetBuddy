@@ -1,6 +1,6 @@
 'use strict';
 // Desktop wrapper: starts the local Budget Buddy server and shows it in a native window.
-const { app, BrowserWindow, shell } = require('electron');
+const { app, BrowserWindow, Menu, shell } = require('electron');
 const path = require('node:path');
 
 async function startServer() {
@@ -30,6 +30,22 @@ async function createWindow() {
     return { action: 'deny' };
   });
   win.loadURL(`http://localhost:${port}/`);
+  buildMenu(win);
+}
+
+// App menu: Settings lives under File instead of the sidebar.
+function buildMenu(win) {
+  const openSettings = () => win.webContents.executeJavaScript("location.hash = 'settings'");
+  Menu.setApplicationMenu(Menu.buildFromTemplate([
+    { label: 'File', submenu: [
+      { label: 'Settings…', accelerator: 'CmdOrCtrl+,', click: openSettings },
+      { type: 'separator' },
+      { role: 'quit' },
+    ] },
+    { role: 'editMenu' },
+    { role: 'viewMenu' },
+    { role: 'windowMenu' },
+  ]));
 }
 
 app.whenReady().then(createWindow);

@@ -214,6 +214,14 @@ test('API: demo data, summary, edits, bulk, csv, security', async (t) => {
   const month = new Date().toISOString().slice(0, 7);
   const s = (await call(`/api/summary?month=${month}`)).body;
   assert.ok(s.income > 0 && s.spending > 0);
+  {
+    // Income counts only the Income category; refunds in other categories lower spending.
+    const rows = (await call(`/api/transactions?month=${month}`)).body.filter((t) => !t.exclude && t.category !== 'Transfer');
+    const inc = rows.filter((t) => t.category === 'Income').reduce((a, t) => a + t.amount, 0);
+    const spend = rows.filter((t) => t.category !== 'Income').reduce((a, t) => a - t.amount, 0);
+    assert.ok(Math.abs(s.income - inc) < 0.01, 'income = Income category only');
+    assert.ok(Math.abs(s.spending - spend) < 0.01, 'spending is net of refunds');
+  }
   assert.ok(!s.byCategory.some((c) => c.category === 'Transfer'), 'transfers excluded from spending');
   assert.ok(s.byCategory.find((c) => c.category === 'Groceries').budget === 500);
 
@@ -381,4 +389,215 @@ test('API: create, rename/merge, delete categories and apply to similar', async 
   assert.ok(!m.categories.some((c) => c.name === 'Shopping'));
   assert.equal(m.rules.length, 0);
   assert.equal((await call('/api/categories?name=Uncategorized', { method: 'DELETE' })).status, 400);
+});
+
+test('API: exclude categories from totals', async (t) => {
+  const { server, port } = await start(0, { plaidClient: fakePlaid([]) });
+  t.after(() => server.close());
+  const call = async (p, opts = {}) => {
+    const res = await fetch(`http://127.0.0.1:${port}${p}`, { ...opts, headers: { 'Content-Type': 'application/json', 'X-Budget-Buddy': '1' } });
+    return { status: res.status, body: await res.json() };
+  };
+  await call('/api/demo', { method: 'POST' });
+  const month = new Date().toISOString().slice(0, 7);
+  const before = (await call(`/api/summary?month=${month}`)).body;
+  assert.deepEqual(before.excludedCategories, ['Transfer']);
+  const cat = before.byCategory.find((c) => c.spent > 0 && c.count > 0);
+  assert.ok(cat, 'demo month has spending');
+  await call('/api/budgets', { method: 'PUT', body: JSON.stringify({ category: cat.category, monthly_limit: 999 }) });
+
+  const r = (await call('/api/categories/exclude', { method: 'PUT', body: JSON.stringify({ name: cat.category.toLowerCase(), excluded: true }) })).body;
+  assert.equal(r.name, cat.category, 'matches stored spelling');
+  const after = (await call(`/api/summary?month=${month}`)).body;
+  assert.ok(!after.byCategory.some((c) => c.category === cat.category), 'gone from by-category, budget row too');
+  assert.ok(Math.abs(before.spending - cat.spent - after.spending) < 0.01, 'spending drops by that category');
+  assert.equal(after.count, before.count - cat.count);
+  assert.ok(after.excludedCategories.includes(cat.category));
+  const mgr = (await call('/api/categories/manage')).body.categories;
+  assert.equal(mgr.find((c) => c.name === cat.category).excluded, true);
+  assert.deepEqual([mgr.find((c) => c.name === 'Transfer').excluded, mgr.find((c) => c.name === 'Transfer').excludeLocked], [true, true]);
+  assert.ok((await call('/api/categories')).body.excluded.includes(cat.category));
+  assert.ok((await call(`/api/transactions?category=${encodeURIComponent(cat.category)}`)).body.length > 0, 'transactions still listed');
+
+  // Renaming keeps the setting.
+  await call('/api/categories', { method: 'PATCH', body: JSON.stringify({ from: cat.category, to: 'Skipped Stuff' }) });
+  assert.ok((await call(`/api/summary?month=${month}`)).body.excludedCategories.includes('Skipped Stuff'));
+
+  await call('/api/categories/exclude', { method: 'PUT', body: JSON.stringify({ name: 'Skipped Stuff', excluded: false }) });
+  assert.ok(Math.abs((await call(`/api/summary?month=${month}`)).body.spending - before.spending) < 0.01, 'counted again');
+  assert.equal((await call('/api/categories/exclude', { method: 'PUT', body: JSON.stringify({ name: 'Transfer', excluded: false }) })).status, 400);
+});
+
+test('projections: pay schedules', () => {
+  const { payDates } = require('../server/projections');
+  assert.deepEqual(payDates({ frequency: 'biweekly', anchor: '2026-10-30' }, '2026-11-01', '2026-11-30'), ['2026-11-13', '2026-11-27']);
+  assert.deepEqual(payDates({ frequency: 'weekly', anchor: '2026-11-06' }, '2026-11-12', '2026-11-30'), ['2026-11-13', '2026-11-20', '2026-11-27']);
+  assert.deepEqual(payDates({ frequency: 'semimonthly', anchor: '2026-11-15', days: [15, 31] }, '2026-11-01', '2027-02-28'),
+    ['2026-11-15', '2026-11-30', '2026-12-15', '2026-12-31', '2027-01-15', '2027-01-31', '2027-02-15', '2027-02-28']);
+  assert.deepEqual(payDates({ frequency: 'monthly', anchor: '2026-10-31' }, '2026-11-01', '2027-02-28'), ['2026-11-30', '2026-12-31', '2027-01-31', '2027-02-28']);
+});
+
+test('projections: detects paychecks, adjusts them, projects month and year', async (t) => {
+  const db = open(fs.mkdtempSync(path.join(os.tmpdir(), 'bb-proj-')));
+  db.prepare("INSERT INTO enrollments (id, provider, access_token) VALUES ('e', 'plaid', 'tok')").run();
+  db.prepare("INSERT INTO accounts (id, enrollment_id, name, type, balance_available) VALUES ('chk', 'e', 'Checking', 'depository', '1000')").run();
+  db.prepare("INSERT INTO accounts (id, enrollment_id, name, type, balance_available) VALUES ('card', 'e', 'Card', 'credit', '5000')").run();
+  const add = db.prepare('INSERT INTO transactions (id, account_id, date, amount, description, counterparty, category) VALUES (?, ?, ?, ?, ?, ?, ?)');
+  let n = 0;
+  // Biweekly $1,500 paychecks on Fridays, last one Oct 30; a one-off $50 refund-ish income from someone else.
+  for (let d = Date.parse('2026-05-29T00:00:00Z'); d <= Date.parse('2026-11-12T00:00:00Z'); d += 14 * 86400000) {
+    add.run(`p${n++}`, 'chk', new Date(d).toISOString().slice(0, 10), 1500, 'ACME PAYROLL', 'Acme', 'Income');
+  }
+  add.run('gift', 'chk', '2026-11-03', 50, 'ZELLE FROM MOM', 'Mom', 'Income');
+  // Rent $1,000 on the 1st every month; groceries $300/month; this month: rent paid, $100 groceries.
+  for (const m of ['07', '08', '09', '10', '11']) add.run(`r${m}`, 'chk', `2026-${m}-01`, -1000, 'RENT', 'Landlord', 'Home');
+  for (const m of ['08', '09', '10']) add.run(`g${m}`, 'card', `2026-${m}-10`, -300, 'GROCER', 'Grocer', 'Groceries');
+  add.run('g11', 'card', '2026-11-05', -100, 'GROCER', 'Grocer', 'Groceries');
+  add.run('xfer', 'chk', '2026-11-06', -400, 'CARD PAYMENT', 'Bank', 'Transfer');
+
+  const { project, saveStream, addStream } = require('../server/projections');
+  const { summaryFor } = require('../server').__test;
+  const run = (period) => project(db, { period, today: '2026-11-12' }, summaryFor);
+
+  let p = run('month');
+  const [pay] = p.income.streams;
+  assert.equal(p.income.streams.length, 1, 'one-off income is not a paycheck');
+  assert.deepEqual([pay.name, pay.frequency, pay.amount, pay.nextDate], ['Acme', 'biweekly', 1500, '2026-11-13']);
+  assert.deepEqual(pay.expectedDates, ['2026-11-13', '2026-11-27']);
+  assert.equal(p.income.soFar, 50, 'no paycheck yet this month, just the $50');
+  assert.equal(p.income.expected, 3000);
+  assert.equal(p.spending.soFar, 1100, 'transfers left out');
+  assert.equal(p.leftToSpend, 50 + 3000 - 1100);
+  const home = p.byCategory.find((c) => c.category === 'Home');
+  const groc = p.byCategory.find((c) => c.category === 'Groceries');
+  assert.deepEqual([home.typical, home.remaining], [1000, 0], 'rent already paid this month is not projected again');
+  assert.deepEqual([groc.typical, groc.remaining], [300, 200]);
+  assert.equal(p.balance.end, 1000 + 3000 - 200);
+  assert.equal(p.weekEnd, '2026-11-15');
+  assert.equal(p.balance.week, round(1000 + 1500 - 200 * 4 / 19));
+
+  // Budgets replace "usual" spending; a budget below your usual pace isn't flagged.
+  db.prepare("INSERT INTO budgets VALUES ('Groceries', 250)").run();
+  p = run('month');
+  const g2 = p.byCategory.find((c) => c.category === 'Groceries');
+  assert.deepEqual([g2.budget, g2.remaining, g2.status], [250, 150, 'ok']);
+
+  // Your changes: amount and frequency; null goes back to detected.
+  saveStream(db, { key: pay.key, amount: 1800, frequency: 'weekly' });
+  p = run('month');
+  assert.deepEqual(p.income.streams[0].expectedDates, ['2026-11-13', '2026-11-20', '2026-11-27']);
+  assert.equal(p.income.expected, 5400);
+  saveStream(db, { key: pay.key, amount: null, frequency: null, enabled: false });
+  p = run('month');
+  assert.deepEqual([p.income.streams[0].amount, p.income.expected], [1500, 0]);
+  saveStream(db, { key: pay.key, enabled: true });
+  addStream(db, { name: 'Side gig', amount: 200, frequency: 'monthly', next_date: '2026-11-20' });
+
+  p = run('year');
+  assert.equal(p.income.streams.length, 2);
+  assert.deepEqual(p.income.streams[0].expectedDates, ['2026-11-13', '2026-11-27', '2026-12-11', '2026-12-25']);
+  assert.deepEqual(p.income.streams[1].expectedDates, ['2026-11-20', '2026-12-20']);
+  assert.equal(p.income.expected, 6400);
+  const homeY = p.byCategory.find((c) => c.category === 'Home');
+  assert.deepEqual([homeY.spent, homeY.remaining], [5000, 1000], 'December rent still to come');
+  const gY = p.byCategory.find((c) => c.category === 'Groceries');
+  assert.deepEqual([gY.budget, gY.remaining], [3000, 400]);
+  assert.equal(p.to, '2026-12-31');
+  assert.throws(() => saveStream(db, { key: pay.key, frequency: 'daily' }), /frequency/);
+
+  function round(x) { return Math.round(x * 100) / 100; }
+});
+
+test('projections: paychecks that change size (hours, overtime, holiday pay)', () => {
+  const { payStats } = require('../server/projections');
+  const steady = payStats([1500, 1500, 1500, 1500]);
+  assert.equal(steady.variable, false);
+  const v = payStats([1000, 1200, 1100, 1900, 1000, 1200]); // one holiday/overtime week
+  assert.equal(v.variable, true);
+  assert.deepEqual(v.estimates, { average: 1233.33, recent: 1300, median: 1150, low: 1025, last: 1200 });
+  assert.deepEqual([v.low, v.high, v.min, v.max], [1025, 1200, 1000, 1900]);
+
+  const db = open(fs.mkdtempSync(path.join(os.tmpdir(), 'bb-var-')));
+  db.prepare("INSERT INTO enrollments (id, provider, access_token) VALUES ('e', 'plaid', 'tok')").run();
+  db.prepare("INSERT INTO accounts (id, enrollment_id, name, type, balance_available) VALUES ('chk', 'e', 'Checking', 'depository', '500')").run();
+  const add = db.prepare('INSERT INTO transactions (id, account_id, date, amount, description, counterparty, category) VALUES (?, ?, ?, ?, ?, ?, ?)');
+  // Weekly hourly paychecks on Fridays: mostly $800–$900, a holiday week of $1,300.
+  const amounts = [800, 850, 900, 820, 880, 1300, 840, 860];
+  let d = Date.parse('2026-09-18T00:00:00Z');
+  amounts.forEach((a, i) => { add.run(`w${i}`, 'chk', new Date(d).toISOString().slice(0, 10), a, 'SHOP PAYROLL', 'Shop', 'Income'); d += 7 * 86400000; });
+  const { project, saveStream } = require('../server/projections');
+  const { summaryFor } = require('../server').__test;
+  const run = () => project(db, { period: 'month', today: '2026-11-12' }, summaryFor);
+
+  let p = run();
+  let [s] = p.income.streams;
+  assert.deepEqual([s.frequency, s.variable, s.estimate, s.nextDate], ['weekly', true, 'average', '2026-11-13']);
+  assert.equal(s.amount, 906.25, '6-month average by default');
+  assert.deepEqual(s.expectedDates, ['2026-11-13', '2026-11-20', '2026-11-27']);
+  assert.equal(p.income.expected, round(906.25 * 3));
+  assert.deepEqual(s.range, { low: 835, high: 885 });
+  assert.deepEqual(p.income.range && [p.income.range.low, p.income.range.high], [2505, 2655]);
+  assert.deepEqual(p.balance.endRange, { low: 500 + 2505, high: 500 + 2655 });
+
+  saveStream(db, { key: s.key, estimate: 'median' });
+  s = run().income.streams[0];
+  assert.deepEqual([s.estimate, s.amount, s.changed.estimate], ['median', 855, true]);
+  saveStream(db, { key: s.key, estimate: 'low' });
+  assert.equal(run().income.streams[0].amount, 835);
+  // Typing an amount wins, and there's no range around a number you chose.
+  saveStream(db, { key: s.key, amount: 1000 });
+  p = run();
+  s = p.income.streams[0];
+  assert.deepEqual([s.estimate, s.amount, s.range, p.income.range], ['custom', 1000, null, null]);
+  saveStream(db, { key: s.key, amount: null, estimate: 'last' });
+  assert.equal(run().income.streams[0].amount, 860);
+  saveStream(db, { key: s.key, estimate: null });
+  assert.equal(run().income.streams[0].estimate, 'average', 'null goes back to the default');
+  assert.throws(() => saveStream(db, { key: s.key, estimate: 'guess' }), /estimate/);
+
+  function round(x) { return Math.round(x * 100) / 100; }
+});
+
+test('API: projections and income streams', async (t) => {
+  const { server, port } = await start(0, { plaidClient: fakePlaid([]) });
+  t.after(() => server.close());
+  const call = async (p, opts = {}) => {
+    const res = await fetch(`http://127.0.0.1:${port}${p}`, { ...opts, headers: { 'Content-Type': 'application/json', 'X-Budget-Buddy': '1' } });
+    return { status: res.status, body: await res.json() };
+  };
+  await call('/api/demo', { method: 'POST' });
+  const today = new Date().toISOString().slice(0, 10);
+  const m = (await call(`/api/projections?period=month&today=${today}`)).body;
+  assert.equal(m.period, 'month');
+  const acme = m.income.streams.find((s) => s.name === 'Acme Corp');
+  assert.equal(acme.frequency, 'semimonthly');
+  assert.equal(acme.amount, 2650);
+  assert.ok(Math.abs(m.leftToSpend - (m.income.projected - m.spending.soFar)) < 0.01);
+  assert.equal(m.cash.total, 3245.18, 'checking only, not the credit card');
+  const y = (await call(`/api/projections?period=year&today=${today}`)).body;
+  assert.equal(y.to.slice(5), '12-31');
+  assert.ok(y.income.expected >= m.income.expected);
+
+  assert.equal((await call('/api/income-streams', { method: 'PUT', body: JSON.stringify({ key: acme.key, amount: 3000 }) })).status, 200);
+  assert.equal((await call(`/api/projections?today=${today}`)).body.income.streams.find((s) => s.key === acme.key).amount, 3000);
+  assert.equal((await call(`/api/income-streams?key=${encodeURIComponent(acme.key)}`, { method: 'DELETE' })).status, 200);
+  assert.equal((await call(`/api/projections?today=${today}`)).body.income.streams.find((s) => s.key === acme.key).amount, 2650, 'reset');
+  const added = (await call('/api/income-streams', { method: 'POST', body: JSON.stringify({ name: 'Bonus', amount: 500, frequency: 'monthly' }) })).body;
+  assert.ok(added.key.startsWith('manual:'));
+  assert.equal((await call('/api/income-streams', { method: 'PUT', body: JSON.stringify({ key: added.key, amount: -5 }) })).status, 400);
+
+  // Leaving an account out of Projections drops its balance, paychecks and spending there only.
+  const chk = m.accounts.find((a) => a.type === 'depository');
+  assert.ok(m.accounts.every((a) => a.included), 'every account counts by default');
+  assert.equal((await call(`/api/accounts/${chk.id}`, { method: 'PATCH', body: JSON.stringify({ in_projections: false }) })).status, 200);
+  const off = (await call(`/api/projections?today=${today}`)).body;
+  assert.equal(off.accounts.find((a) => a.id === chk.id).included, false);
+  assert.ok(!off.cash.accounts.some((a) => a.name === chk.name), 'its balance is left out');
+  assert.ok(!off.income.streams.some((s) => s.name === 'Acme Corp'), 'its paychecks are left out');
+  assert.ok(off.spending.soFar <= m.spending.soFar);
+  const from = today.slice(0, 8) + '01';
+  const dash = (await call(`/api/summary?from=${from}&to=${today}`)).body;
+  assert.ok(Math.abs(dash.spending - m.spending.soFar) < 0.01, 'the Dashboard still counts every account');
+  await call(`/api/accounts/${chk.id}`, { method: 'PATCH', body: JSON.stringify({ in_projections: true }) });
+  assert.ok(Math.abs((await call(`/api/projections?today=${today}`)).body.cash.total - 3245.18) < 0.01, 'back in');
 });
